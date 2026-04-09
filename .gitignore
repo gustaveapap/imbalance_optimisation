@@ -1,0 +1,75 @@
+# Virtual environments
+venv/
+.venv/
+env/
+**/venv/
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+
+# Trained model artefacts (large binaries — track with Git LFS if needed)
+*.joblib
+*.pkl
+*.pickle
+
+# Logs
+logs/
+*.log
+forecast_log.csv
+
+# Data files (raw/processed data — usually too large for git)
+*.csv
+*.parquet
+*.feather
+*.h5
+*.hdf5
+
+# Environment variables & secrets
+.env
+.env.*
+!.env.example
+secrets.json
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/settings.json
+.idea/
+*.swp
+*.swo
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+*.egg
+
+# Coverage & test artefacts
+.coverage
+htmlcov/
+.pytest_cache/
+.tox/
+
+# Selenium / Chrome binaries
+chrome-win64/
+drivers/
+chromedriver*
+
+# Outputs (generated — not source; .gitkeep files preserved)
+outputs/**
+!outputs/**/
+!outputs/**/.gitkeep
+
+# Temporary
+*.tmp
+*.bak

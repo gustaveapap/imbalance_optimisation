@@ -1,0 +1,120 @@
+# -*- coding: utf-8 -*-
+# ====================================
+# ✅ EU aFRR merit-order – DE BE NL (tout-en-un)
+# Fix définitif pour la partie 🇩🇪 Allemagne :
+# - Détection directe du dernier fichier RESULT_LIST*.xls* dans Downloads
+# - Plus de problème de nom ou de variante
+# ====================================
+
+import os
+import time
+import glob
+import shutil
+import pandas as pd
+from datetime import datetime
+
+# ================================
+# 📅 Paramètres & chemins
+# ================================
+TIMEZONE = "Europe/Brussels"
+DATE_STR = datetime.now().strftime("%Y-%m-%d")
+START_DATE = pd.Timestamp(DATE_STR)
+
+DOWNLOADS_DIR = os.path.join(os.path.expanduser('~'), 'Downloads')
+os.makedirs(DOWNLOADS_DIR, exist_ok=True)
+
+DE_OUTFILE = os.path.join(DOWNLOADS_DIR, f"afrr_anonymousresults_DE_{DATE_STR}.xlsx")
+
+# ================================
+# 🔧 Utilitaire : détection du fichier DE
+# ================================
+def _find_latest_de_xlsx(download_dir, timeout=60):
+    """
+    Retourne le dernier fichier Excel DE dans download_dir qui commence par RESULT_LIST.
+    Attend jusqu'à 'timeout' secondes si rien trouvé.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        # Attendre la fin des téléchargements
+        if glob.glob(os.path.join(download_dir, "*.crdownload")):
+            time.sleep(1)
+            continue
+
+        # Chercher les RESULT_LIST*.xls*
+        cands = glob.glob(os.path.join(download_dir, "RESULT_LIST*.xls*"))
+        if cands:
+            latest = max(cands, key=os.path.getmtime)
+            print(f"📂 [DE] Fichier détecté → {os.path.basename(latest)}")
+            return latest
+
+        time.sleep(1)
+
+    raise RuntimeError("❌ [DE] Aucun fichier RESULT_LIST trouvé dans Downloads.")
+
+# ================================
+# 🇩🇪 Allemagne – Selenium (télécharge, choisit le dernier, renomme, lit)
+# ================================
+def fetch_germany():
+    print("🔽 [DE] Téléchargement via Selenium…")
+    from selenium import webdriver
+    from selenium.webdriver.chrome.options import Options
+
+    chrome_options = Options()
+    prefs = {
+        "download.default_directory": DOWNLOADS_DIR,
+        "download.prompt_for_download": False,
+        "directory_upgrade": True,
+        "safebrowsing.enabled": True,
+    }
+    chrome_options.add_experimental_option("prefs", prefs)
+    chrome_options.add_argument("--headless")
+
+    driver = webdriver.Chrome(options=chrome_options)
+    target_url = f"https://www.regelleistung.net/apps/datacenter/tenders?productTypes=SRL&markets=BALANCING_ENERGY&date={DATE_STR}"
+    driver.get(target_url)
+    time.sleep(5)
+
+    # Tous les liens vers un .xlsx
+    links = driver.find_elements("xpath", "//a[contains(@href, 'xlsx')]")
+    if not links:
+        driver.quit()
+        raise RuntimeError("❌ [DE] Aucun lien .xlsx trouvé.")
+
+    # Clic direct
+    links[0].click()
+    driver.quit()
+
+    # Attendre et détecter le fichier RESULT_LIST
+    latest_file = _find_latest_de_xlsx(DOWNLOADS_DIR, timeout=120)
+    if latest_file is None:
+        raise RuntimeError("❌ [DE] .xlsx introuvable après téléchargement.")
+
+    # Renommer en nom canonique
+    if os.path.abspath(latest_file) != os.path.abspath(DE_OUTFILE):
+        if os.path.exists(DE_OUTFILE):
+            os.remove(DE_OUTFILE)
+        shutil.move(latest_file, DE_OUTFILE)
+        print(f"📦 [DE] Fichier renommé → {DE_OUTFILE}")
+    else:
+        print(f"📦 [DE] Fichier déjà au nom canonique → {DE_OUTFILE}")
+
+    # Lire immédiatement la 1re feuille
+    xde = pd.read_excel(DE_OUTFILE, sheet_name=0)
+    return xde
+
+# ================================
+# 🧪 Pré-traitements harmonisés
+# ================================
+def preprocess_de(xde: pd.DataFrame) -> pd.DataFrame:
+    # QH_IDX 001 → 0000 (donc (idx-1)*15 min)
+    xde['QH_IDX'] = xde['PRODUCT'].str.extract(r'(\\d{3})').astype(float)
+    xde = xde.dropna(subset=['QH_IDX']).copy()
+    xde['QH_IDX'] = xde['QH_IDX'].astype(int)
+    xde['Timestamp'] = START_DATE + pd.to_timedelta((xde['QH_IDX'] - 1) * 15, unit='m')
+
+    # Filtre journée
+    xde_day = xde[(xde['Timestamp'] >= START_DATE) &
+                  (xde['Timestamp'] < START_DATE + pd.Timedelta(days=1))].copy()
+    if xde_day.empty:
+        raise RuntimeError("❌ [DE] Aucun enregistrement pour la journée.")
+    return xde_day
