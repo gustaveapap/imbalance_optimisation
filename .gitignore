@@ -15,10 +15,16 @@ __pycache__/
 *.pkl
 *.pickle
 
-# Logs
-logs/
+# Logs (runtime output — .gitkeep files preserved)
+logs/**
+!logs/**/
+!logs/**/.gitkeep
 *.log
 forecast_log.csv
+
+# NSSM service logs (runtime output, not source)
+forecasters/*/stdout.log
+forecasters/*/stderr.log
 
 # Data files (raw/processed data — usually too large for git)
 *.csv
