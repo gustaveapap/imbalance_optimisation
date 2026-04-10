@@ -5,114 +5,123 @@
     Run once as Administrator. Services will start automatically on boot.
 
 .USAGE
-    Right-click PowerShell → "Run as administrator"
+    Right-click PowerShell -> "Run as administrator"
     cd C:\Users\gusta\imbalance_optimisation
     .\scripts\install_services.ps1
 #>
 
-Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-# ── Paths ────────────────────────────────────────────────────────────────────
+# ── Paths ─────────────────────────────────────────────────────────────────────
 $Root    = "C:\Users\gusta\imbalance_optimisation"
 $Python  = "$Root\venv\Scripts\python.exe"
-$Nssm    = "$env:LOCALAPPDATA\Microsoft\WinGet\Packages\NSSM.NSSM_Microsoft.Winget.Source_8wekyb3d8bbwe\nssm-2.24-101-g897c7ad\win64\nssm.exe"
+$Nssm    = "C:\Users\gusta\AppData\Local\Microsoft\WinGet\Packages\NSSM.NSSM_Microsoft.Winget.Source_8wekyb3d8bbwe\nssm-2.24-101-g897c7ad\win64\nssm.exe"
 $LogRoot = "$Root\logs"
 
-# ── Validate prerequisites ────────────────────────────────────────────────────
-foreach ($path in @($Python, $Nssm)) {
-    if (-not (Test-Path $path)) {
-        Write-Error "Not found: $path"
-        exit 1
-    }
+# ── Validate prerequisites ─────────────────────────────────────────────────────
+if (-not (Test-Path $Python)) {
+    Write-Host "ERROR: Python not found at $Python"
+    exit 1
+}
+if (-not (Test-Path $Nssm)) {
+    Write-Host "ERROR: NSSM not found at $Nssm"
+    exit 1
 }
 
-# ── Service definitions ───────────────────────────────────────────────────────
-$services = @(
-    @{
-        Name        = "EliaImbalanceForecaster"
-        DisplayName = "Elia Imbalance Forecaster"
-        Description = "Real-time Belgian grid (Elia) imbalance forecaster. Flask API on port 8080."
-        AppDir      = "$Root\forecasters\elia_forecaster"
-        Script      = "app.py"
-        LogDir      = "$LogRoot\elia_forecaster"
-    },
-    @{
-        Name        = "RteImbalanceForecaster"
-        DisplayName = "RTE Imbalance Forecaster"
-        Description = "French grid (RTE) imbalance forecast scheduler. Runs every 15 minutes via APScheduler."
-        AppDir      = "$Root\forecasters\rte_forecaster"
-        Script      = "run_forecast_scheduler.py"
-        LogDir      = "$LogRoot\rte_forecaster"
-    }
-)
+# ── Service definitions ────────────────────────────────────────────────────────
+$eliaName        = "EliaImbalanceForecaster"
+$eliaDisplay     = "Elia Imbalance Forecaster"
+$eliaDescription = "Real-time Belgian grid (Elia) imbalance forecaster. Flask API on port 8080."
+$eliaAppDir      = "$Root\forecasters\elia_forecaster"
+$eliaScript      = "app.py"
+$eliaLogDir      = "$LogRoot\elia_forecaster"
 
-# ── Install / reconfigure each service ───────────────────────────────────────
-foreach ($svc in $services) {
-    $name = $svc.Name
+$rteName        = "RteImbalanceForecaster"
+$rteDisplay     = "RTE Imbalance Forecaster"
+$rteDescription = "French grid (RTE) imbalance forecast scheduler. Runs every 15 minutes via APScheduler."
+$rteAppDir      = "$Root\forecasters\rte_forecaster"
+$rteScript      = "run_forecast_scheduler.py"
+$rteLogDir      = "$LogRoot\rte_forecaster"
 
-    Write-Host "`n── $name ──────────────────────────────────" -ForegroundColor Cyan
+# ── Helper function ────────────────────────────────────────────────────────────
+function Install-ForecastService($name, $displayName, $description, $appDir, $script, $logDir) {
 
-    # Remove existing service cleanly if present
+    Write-Host ""
+    Write-Host "── $name ──────────────────────────────────"
+
+    # Remove existing service if present
     $existing = Get-Service -Name $name -ErrorAction SilentlyContinue
     if ($existing) {
-        Write-Host "  Removing existing service..." -ForegroundColor Yellow
-        if ($existing.Status -eq 'Running') {
-            & $Nssm stop $name confirm | Out-Null
+        Write-Host "  Removing existing service..."
+        if ($existing.Status -eq "Running") {
+            & $Nssm stop $name confirm
             Start-Sleep -Seconds 2
         }
-        & $Nssm remove $name confirm | Out-Null
+        & $Nssm remove $name confirm
         Start-Sleep -Seconds 1
     }
 
     # Ensure log directory exists
-    New-Item -ItemType Directory -Force -Path $svc.LogDir | Out-Null
+    if (-not (Test-Path $logDir)) {
+        New-Item -ItemType Directory -Path $logDir | Out-Null
+    }
 
-    # Install
+    # Install service
     Write-Host "  Installing service..."
-    & $Nssm install $name $Python $svc.Script
+    & $Nssm install $name $Python $script
 
     # Core settings
-    & $Nssm set $name AppDirectory      $svc.AppDir
-    & $Nssm set $name DisplayName       $svc.DisplayName
-    & $Nssm set $name Description       $svc.Description
+    & $Nssm set $name AppDirectory $appDir
+    & $Nssm set $name DisplayName $displayName
+    & $Nssm set $name Description $description
 
-    # Encoding — avoids UnicodeEncodeError on Windows cp1252 terminals
+    # UTF-8 encoding to avoid UnicodeEncodeError on Windows terminals
     & $Nssm set $name AppEnvironmentExtra "PYTHONIOENCODING=utf-8"
 
-    # Stdout / stderr → rotating log files
-    & $Nssm set $name AppStdout                    "$($svc.LogDir)\stdout.log"
-    & $Nssm set $name AppStderr                    "$($svc.LogDir)\stderr.log"
-    & $Nssm set $name AppStdoutCreationDisposition 4   # append
-    & $Nssm set $name AppStderrCreationDisposition 4   # append
-    & $Nssm set $name AppRotateFiles               1
-    & $Nssm set $name AppRotateSeconds             86400  # rotate daily
-    & $Nssm set $name AppRotateBytes               10485760  # 10 MB max per file
+    # Stdout / stderr log files
+    $stdoutLog = "$logDir\stdout.log"
+    $stderrLog = "$logDir\stderr.log"
+    & $Nssm set $name AppStdout $stdoutLog
+    & $Nssm set $name AppStderr $stderrLog
+    & $Nssm set $name AppStdoutCreationDisposition 4
+    & $Nssm set $name AppStderrCreationDisposition 4
 
-    # Restart on failure — wait 5 s before restarting
-    & $Nssm set $name AppExit         Default Restart
+    # Log rotation: daily or 10 MB
+    & $Nssm set $name AppRotateFiles 1
+    & $Nssm set $name AppRotateSeconds 86400
+    & $Nssm set $name AppRotateBytes 10485760
+
+    # Restart on failure after 5 seconds
+    & $Nssm set $name AppExit Default Restart
     & $Nssm set $name AppRestartDelay 5000
 
-    # Startup type — automatic (starts on boot, before login)
+    # Auto-start on boot
     & $Nssm set $name Start SERVICE_AUTO_START
 
-    Write-Host "  OK — $name configured." -ForegroundColor Green
+    Write-Host "  OK -- $name configured."
 }
 
-# ── Start services ────────────────────────────────────────────────────────────
-Write-Host "`n── Starting services ────────────────────────" -ForegroundColor Cyan
-foreach ($svc in $services) {
-    Write-Host "  Starting $($svc.Name)..."
-    & $Nssm start $($svc.Name)
-    Start-Sleep -Seconds 2
-    $status = (Get-Service -Name $svc.Name).Status
-    Write-Host "  Status: $status" -ForegroundColor $(if ($status -eq 'Running') { 'Green' } else { 'Yellow' })
-}
+# ── Install both services ──────────────────────────────────────────────────────
+Install-ForecastService $eliaName $eliaDisplay $eliaDescription $eliaAppDir $eliaScript $eliaLogDir
+Install-ForecastService $rteName  $rteDisplay  $rteDescription  $rteAppDir  $rteScript  $rteLogDir
+
+# ── Start both services ────────────────────────────────────────────────────────
+Write-Host ""
+Write-Host "── Starting services ────────────────────────"
+
+& $Nssm start $eliaName
+Start-Sleep -Seconds 2
+$eliaStatus = (Get-Service -Name $eliaName).Status
+Write-Host "  $eliaName status: $eliaStatus"
+
+& $Nssm start $rteName
+Start-Sleep -Seconds 2
+$rteStatus = (Get-Service -Name $rteName).Status
+Write-Host "  $rteName status: $rteStatus"
 
 # ── Summary ───────────────────────────────────────────────────────────────────
-Write-Host "`n════════════════════════════════════════════" -ForegroundColor Cyan
-Write-Host " Services installed and started." -ForegroundColor Green
-Write-Host " Manage via:  services.msc  or  sc.exe" -ForegroundColor White
-Write-Host " Logs:        $LogRoot" -ForegroundColor White
-Write-Host " Elia UI:     http://localhost:8080" -ForegroundColor White
-Write-Host "════════════════════════════════════════════`n" -ForegroundColor Cyan
+Write-Host ""
+Write-Host "Services installed and started."
+Write-Host "Manage via: services.msc or sc.exe"
+Write-Host "Logs:       $LogRoot"
+Write-Host "Elia UI:    http://localhost:8080"

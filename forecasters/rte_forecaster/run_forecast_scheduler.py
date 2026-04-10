@@ -87,37 +87,25 @@ def run_cycle():
 
         tok = get_token(CLIENT_ID, CLIENT_SECRET)
 
-        for attempt in range(30):
+        MAX_DATA_RETRIES = 5
+        for attempt in range(MAX_DATA_RETRIES):
             raw = download_imbalance(tok, start, forecast_target)
-            print("🧪 Données brutes récupérées :", raw.index.min(), "→", raw.index.max())
-            print("🧮 Quart-heures disponibles :", len(raw))
-            missing = raw.asfreq('15min').isna().sum()['imbalance_mwh']
-            print("📉 Quart-heures manquants ?", missing)
-            
-            # DEBUG AJOUTÉ
-            print(f"🔎 DEBUG - forecast_target : {forecast_target} (type: {type(forecast_target)})")
-            print(f"🔎 DEBUG - latest_needed recherché : {latest_needed} (type: {type(latest_needed)})")
-            print(f"🔎 DEBUG - Timezone latest_needed : {latest_needed.tzinfo}")
-            print(f"🔎 DEBUG - raw.index[-5:] : {raw.index[-5:].tolist()}")
-            print(f"🔎 DEBUG - Timezone raw.index : {raw.index[-1].tzinfo if hasattr(raw.index[-1], 'tzinfo') else 'None'}")
-            print(f"🔎 DEBUG - latest_needed in raw.index ? {latest_needed in raw.index}")
-            
-            if latest_needed in raw.index:
-                val = raw.at[latest_needed, 'imbalance_mwh']
-                print(f"🔎 DEBUG - Valeur à latest_needed : {val}")
-                print(f"🔎 DEBUG - Est non-NaN ? {pd.notna(val)}")
-
             if latest_needed in raw.index and pd.notna(raw.at[latest_needed, 'imbalance_mwh']):
-                logging.info("✅ Donnée %s disponible, on prédit %s.",
-                             latest_needed.strftime('%H:%M'),
+                logging.info("✅ Donnée %s disponible (tentative %d/%d), on prédit %s.",
+                             latest_needed.strftime('%H:%M'), attempt + 1, MAX_DATA_RETRIES,
                              forecast_target.strftime('%H:%M'))
                 break
-            logging.info("🔁 Tentative %d/30 : donnée %s indisponible, attente 30s...",
-                         attempt + 1, latest_needed.strftime('%H:%M'))
+            logging.info("🔁 Tentative %d/%d : QH %s indisponible (dernier reçu : %s), attente 30s...",
+                         attempt + 1, MAX_DATA_RETRIES, latest_needed.strftime('%H:%M'),
+                         raw.index.max().strftime('%H:%M') if not raw.empty else 'N/A')
             time.sleep(30)
         else:
-            logging.warning("⚠️ Donnée %s toujours indisponible après 15 min. Prévision annulée.",
-                            latest_needed.strftime('%H:%M'))
+            logging.warning(
+                "⚠️ CYCLE IGNORÉ — QH %s toujours indisponible après %d tentatives (%.0f s). "
+                "Dernier QH reçu : %s. Le cycle sera relancé à %s.",
+                latest_needed.strftime('%H:%M'), MAX_DATA_RETRIES, MAX_DATA_RETRIES * 30,
+                raw.index.max().strftime('%H:%M') if not raw.empty else 'N/A',
+                (forecast_target + dt.timedelta(minutes=15)).strftime('%H:%M'))
             return
 
         feat = build_features(raw)

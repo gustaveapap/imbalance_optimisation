@@ -4,6 +4,7 @@
 
 import os, time, glob, shutil, tempfile, argparse, sys
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 import pandas as pd
 import numpy as np
 import requests
@@ -244,10 +245,16 @@ def download_nl_csv_for_day(date_str: str, out_path: Path, api_key: str = "18fe1
     url = "https://api.tennet.eu/publications/v1/merit-order-list"
     headers = {"apikey": api_key, "Accept": "text/csv"}
     MAX_RETRIES, SLEEP_SECONDS = 3, 6
+    # TenNET API parameters use CET/CEST local time (naive datetime is correct for their API).
+    # We use Europe/Brussels to determine the current local hour so we don't fetch future hours
+    # — this handles CEST (UTC+2 in summer) correctly, avoiding an off-by-2 error vs UTC.
     base = datetime.strptime(date_str + " 00:00:00", "%Y-%m-%d %H:%M:%S")
+    now_local = datetime.now(ZoneInfo("Europe/Brussels"))
+    today_local = now_local.strftime("%Y-%m-%d")
+    max_hour = now_local.hour if date_str == today_local else 23
 
     all_dfs = []
-    for hour in range(24):
+    for hour in range(max_hour + 1):
         from_time = (base + timedelta(hours=hour)).strftime("%d-%m-%Y %H:%M:%S")
         to_time   = (base + timedelta(hours=hour+1)).strftime("%d-%m-%Y %H:%M:%S")
         params = {"date_from": from_time, "date_to": to_time}
