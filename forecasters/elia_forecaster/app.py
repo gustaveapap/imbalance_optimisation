@@ -124,10 +124,148 @@ def home():
             <button type="submit">Afficher le dashboard</button>
         </form>
         <div class='update'>Dernière mise à jour : {last_update}</div>
+        <div style="margin-top: 30px;">
+            <a href="/evaluation" target="_blank" style="text-decoration: none;">
+                <button type="button">Evaluation Dashboard</button>
+            </a>
+        </div>
+        <div style="margin-top: 16px;">
+            <a href="/dashboard_rte" target="_blank" style="text-decoration: none;">
+                <button type="button" style="background-color:#e8543a;">🇫🇷 RTE FR Dashboard</button>
+            </a>
+        </div>
     </body>
     </html>
     """
     return html
+
+# --------------------------------------------------------------------------------------
+# MODULE-LEVEL HELPERS (used by /dashboard and /evaluation)
+# --------------------------------------------------------------------------------------
+def fetch_opendatasoft(dataset, start_dt, end_dt, page_size=1000):
+    url = "https://external-elia.opendatasoft.com/api/records/1.0/search/"
+    ws_utc = pd.Timestamp(start_dt).tz_localize(BRUSSELS).tz_convert("UTC").strftime("%Y-%m-%dT%H:%M:%SZ")
+    we_utc = pd.Timestamp(end_dt).tz_localize(BRUSSELS).tz_convert("UTC").strftime("%Y-%m-%dT%H:%M:%SZ")
+    all_records, start_i = [], 0
+    while True:
+        params = {"dataset": dataset, "q": f"datetime:[{ws_utc} TO {we_utc}]",
+                  "rows": page_size, "start": start_i, "sort": "datetime"}
+        r = requests.get(url, params=params, timeout=30)
+        r.raise_for_status()
+        data = r.json().get("records", [])
+        if not data:
+            break
+        all_records.extend(data)
+        if len(data) < page_size:
+            break
+        start_i += page_size
+    if not all_records:
+        return pd.DataFrame(columns=["Datetime", "System imbalance", "imbalanceprice"])
+    df = pd.DataFrame([{
+        "Datetime":         rec["fields"].get("datetime"),
+        "System imbalance": rec["fields"].get("systemimbalance"),
+        "imbalanceprice":   rec["fields"].get("imbalanceprice"),
+    } for rec in all_records])
+    df["Datetime"] = pd.to_datetime(df["Datetime"], utc=True).dt.tz_convert("Europe/Brussels").dt.tz_localize(None)
+    df["System imbalance"] = pd.to_numeric(df["System imbalance"], errors="coerce")
+    df["imbalanceprice"]   = pd.to_numeric(df["imbalanceprice"],   errors="coerce")
+    return df
+
+
+def fetch_actuals_combined(start_dt, end_dt, chunk_days=60):
+    # ODS v1 API hard-limits start+rows <= 10 000 (~10 400 QHs max per call).
+    # Chunk into 60-day windows (5 760 QHs each) to stay well under that limit.
+    frames = []
+    cursor = pd.Timestamp(start_dt)
+    end_ts = pd.Timestamp(end_dt)
+    while cursor < end_ts:
+        chunk_end = min(cursor + pd.Timedelta(days=chunk_days), end_ts)
+        df134 = fetch_opendatasoft("ods134", cursor, chunk_end)
+        df162 = fetch_opendatasoft("ods162", cursor, chunk_end)
+        frames.append(pd.concat([df134, df162], ignore_index=True))
+        cursor = chunk_end
+    if not frames:
+        return pd.DataFrame(columns=["Datetime", "System imbalance", "imbalanceprice"])
+    df = pd.concat(frames, ignore_index=True)
+    return (df.drop_duplicates(subset=["Datetime"], keep="last")
+              .sort_values("Datetime")
+              .reset_index(drop=True))
+
+
+def merge_and_flags(forecasts_df, actuals_df):
+    forecasts_df = forecasts_df.copy()
+    actuals_df   = actuals_df.copy()
+    forecasts_df["Datetime"] = forecasts_df["Datetime"].dt.floor("15min")
+    actuals_df["Datetime"]   = actuals_df["Datetime"].dt.floor("15min")
+    merged = pd.merge(forecasts_df, actuals_df, on="Datetime", how="inner")
+    merged["cap_min"] = merged[["cap_BE", "cap_EU"]].min(axis=1, skipna=True)
+    merged["cap_max"] = merged[["cap_BE", "cap_EU"]].max(axis=1, skipna=True)
+    merged["has_range"]      = merged["cap_min"].notna() & merged["cap_max"].notna()
+    merged["CorrectForecast"] = (merged["Forecast"] * merged["System imbalance"] > 0)
+    merged["InRange"] = merged["has_range"] & (
+        (merged["imbalanceprice"] >= merged["cap_min"]) &
+        (merged["imbalanceprice"] <= merged["cap_max"])
+    )
+    return merged
+
+
+def compute_all_metrics(merged):
+    n_total = len(merged)
+    acc_forecast = round(merged["CorrectForecast"].mean() * 100, 1) if n_total else None
+    subset_range = merged[merged["has_range"]]
+    acc_range_global = round(subset_range["InRange"].mean() * 100, 1) if len(subset_range) else None
+    subset_cf = subset_range[subset_range["CorrectForecast"]]
+    acc_range_when_cf = round(subset_cf["InRange"].mean() * 100, 1) if len(subset_cf) else None
+    corr = round(merged["Forecast"].corr(merged["System imbalance"]), 3)
+    return {
+        "Forecast accuracy":                  acc_forecast,
+        "Range accuracy":                     acc_range_global,
+        "Range accuracy – when forecast correct": acc_range_when_cf,
+        "Correlation":                        corr,
+    }
+
+
+def plot_bloomberg_dashboard_points(merged, metrics):
+    fig = sp.make_subplots(rows=3, cols=1, row_heights=[0.6, 0.25, 0.6], specs=[[{}],[{}],[{}]],
+                           vertical_spacing=0.15,
+                           subplot_titles=["Price Range Accuracy (all QH)", None, "System Imbalance vs Forecast"])
+    color_bg = "#0b0e16"; color_fill = "rgba(0,150,255,0.15)"
+    color_inrange = "deepskyblue"; color_outrange = "orange"
+    color_bar_system = "rgba(0,212,255,0.55)"; color_bar_forecast = "rgba(255,204,0,0.55)"
+    color_grid = "rgba(255,255,255,0.08)"
+    rng = merged[merged["has_range"]].sort_values("Datetime")
+    fig.add_trace(go.Scatter(
+        x=pd.Series(list(rng["Datetime"]) + list(rng["Datetime"][::-1])),
+        y=pd.Series(list(rng["cap_min"])  + list(rng["cap_max"][::-1])),
+        fill="toself", fillcolor=color_fill, line=dict(color="rgba(0,0,0,0)"),
+        hoverinfo="skip", name="Price Range"), row=1, col=1)
+    fig.add_trace(go.Scatter(
+        x=merged["Datetime"][merged["InRange"]], y=merged["imbalanceprice"][merged["InRange"]],
+        mode="markers", marker=dict(color=color_inrange, size=7), name="In range"), row=1, col=1)
+    fig.add_trace(go.Scatter(
+        x=merged["Datetime"][~merged["InRange"]], y=merged["imbalanceprice"][~merged["InRange"]],
+        mode="markers", marker=dict(color=color_outrange, size=7, symbol="x"), name="Out of range"), row=1, col=1)
+    kpi_titles = list(metrics.keys()); kpi_values = list(metrics.values())
+    positions = [0.15, 0.42, 0.68, 0.90]
+    for i, (title, val) in enumerate(zip(kpi_titles, kpi_values)):
+        title_wrapped = title.replace(" – ", "<br>")
+        val_txt = f"{val}%" if isinstance(val, (float, int)) else str(val)
+        fig.add_annotation(xref="paper", yref="paper", x=positions[i], y=0.42,
+                           text=(f"<b style='font-size:22px;color:white'>{val_txt}</b>"
+                                 f"<br><span style='font-size:14px;color:#cccccc'>{title_wrapped}</span>"),
+                           showarrow=False, xanchor="center", align="center")
+    ms = merged.sort_values("Datetime")
+    fig.add_trace(go.Bar(x=ms["Datetime"], y=ms["System imbalance"],
+                         marker_color=color_bar_system, opacity=0.6, name="System"), row=3, col=1)
+    fig.add_trace(go.Bar(x=ms["Datetime"], y=ms["Forecast"],
+                         marker_color=color_bar_forecast, opacity=0.5, name="Forecast"), row=3, col=1)
+    fig.update_layout(template="plotly_dark", paper_bgcolor=color_bg, plot_bgcolor=color_bg,
+                      font=dict(color="white", family="Segoe UI"), height=950,
+                      hovermode="x unified", title="⚡ aFRR Forecast Dashboard — Bloomberg Style")
+    fig.update_xaxes(showgrid=True, gridcolor=color_grid)
+    fig.update_yaxes(showgrid=True, gridcolor=color_grid)
+    return fig
+
 
 # --------------------------------------------------------------------------------------
 # DASHBOARD BLOOMBERG
@@ -142,113 +280,28 @@ def dashboard_bloomberg():
             start_dt = end_dt - timedelta(days=7)
             start, end = start_dt.strftime("%Y-%m-%d"), end_dt.strftime("%Y-%m-%d")
 
-        CSV_PATH = Path("forecastV3.csv")
+        CSV_PATH = BASE_DIR / "forecast_log_full.csv"
 
-        def load_forecasts_any_format(csv_path, start=None, end=None):
-            rows = []
-            with open(csv_path, "r", encoding="utf-8") as f:
-                for line in f:
-                    parts = line.strip().split(",")
-                    if len(parts) >= 9:
-                        ft, fv, fga, pdire, pmin, pmax, vinc, vdec, bp = parts[:9]
-                        rows.append((ft, fv, fga, pdire, pmin, pmax))
-                    elif len(parts) >= 6:
-                        ft, fv, fga, pdire, cbe, ceu = parts[:6]
-                        rows.append((ft, fv, fga, pdire, cbe, ceu))
-                    elif len(parts) == 3:
-                        ft, fv, fga = parts
-                        rows.append((ft, fv, fga, None, None, None))
-                    else:
-                        continue
-            df = pd.DataFrame(rows, columns=["forecast_time","forecast_value","forecast_generated_at","price_direction","cap_BE","cap_EU"])
-            
-            # ✅ CORRECTION DST : Lire comme naive Brussels (pas UTC !)
-            df["forecast_time"] = pd.to_datetime(df["forecast_time"], errors="coerce")
-            df["forecast_generated_at"] = pd.to_datetime(df["forecast_generated_at"], errors="coerce")
-            
-            df["forecast_value"] = pd.to_numeric(df["forecast_value"], errors="coerce")
+        def load_forecasts(csv_path, start=None, end=None):
+            df = pd.read_csv(csv_path, parse_dates=["forecast_time"])
+            df = df.rename(columns={
+                "forecast_value": "Forecast",
+                "forecast_time":  "Datetime",
+                "price_min":      "cap_BE",
+                "price_max":      "cap_EU",
+            })
             df["cap_BE"] = pd.to_numeric(df["cap_BE"], errors="coerce")
             df["cap_EU"] = pd.to_numeric(df["cap_EU"], errors="coerce")
-            df = df.sort_values("forecast_generated_at").drop_duplicates(subset=["forecast_time"], keep="last")
-            
-            # Pas de conversion timezone : déjà en naive Brussels
-            df["Datetime"] = df["forecast_time"]
-            df = df.rename(columns={"forecast_value": "Forecast"})
+            df = df.sort_values("forecast_generated_at").drop_duplicates(subset=["Datetime"], keep="last")
             if start:
                 df = df[df["Datetime"] >= pd.to_datetime(start)]
             if end:
-                df = df[df["Datetime"] <= pd.to_datetime(end)]
+                df = df[df["Datetime"] < pd.Timestamp(end) + pd.Timedelta(days=1)]
             return df.reset_index(drop=True)
 
-        def fetch_opendatasoft(dataset, start_dt, end_dt, page_size=1000):
-            url = "https://external-elia.opendatasoft.com/api/records/1.0/search/"
-            ws_utc = pd.Timestamp(start_dt).tz_localize(BRUSSELS).tz_convert("UTC").strftime("%Y-%m-%dT%H:%M:%SZ")
-            we_utc = pd.Timestamp(end_dt).tz_localize(BRUSSELS).tz_convert("UTC").strftime("%Y-%m-%dT%H:%M:%SZ")
-            all_records, start_i = [], 0
-            while True:
-                params = {"dataset": dataset, "q": f"datetime:[{ws_utc} TO {we_utc}]", "rows": page_size, "start": start_i, "sort": "datetime"}
-                r = requests.get(url, params=params, timeout=30)
-                r.raise_for_status()
-                data = r.json().get("records", [])
-                if not data: break
-                all_records.extend(data)
-                if len(data) < page_size: break
-                start_i += page_size
-            if not all_records:
-                return pd.DataFrame(columns=["Datetime","System imbalance","imbalanceprice"])
-            df = pd.DataFrame([{"Datetime": rec["fields"].get("datetime"),"System imbalance": rec["fields"].get("systemimbalance"),"imbalanceprice": rec["fields"].get("imbalanceprice")} for rec in all_records])
-            df["Datetime"] = pd.to_datetime(df["Datetime"], utc=True).dt.tz_convert("Europe/Brussels").dt.tz_localize(None)
-            df["System imbalance"] = pd.to_numeric(df["System imbalance"], errors="coerce")
-            df["imbalanceprice"] = pd.to_numeric(df["imbalanceprice"], errors="coerce")
-            return df
-
-        def fetch_actuals_combined(start_dt, end_dt):
-            df134 = fetch_opendatasoft("ods134", start_dt, end_dt)
-            df162 = fetch_opendatasoft("ods162", start_dt, end_dt)
-            df = pd.concat([df134, df162], ignore_index=True)
-            return df.drop_duplicates(subset=["Datetime"], keep="last").sort_values("Datetime").reset_index(drop=True)
-
-        def merge_and_flags(forecasts_df, actuals_df):
-            forecasts_df["Datetime"] = forecasts_df["Datetime"].dt.floor("15min")
-            actuals_df["Datetime"] = actuals_df["Datetime"].dt.floor("15min")
-            merged = pd.merge(forecasts_df, actuals_df, on="Datetime", how="inner")
-            merged["cap_min"] = merged[["cap_BE","cap_EU"]].min(axis=1, skipna=True)
-            merged["cap_max"] = merged[["cap_BE","cap_EU"]].max(axis=1, skipna=True)
-            merged["has_range"] = merged["cap_min"].notna() & merged["cap_max"].notna()
-            merged["CorrectForecast"] = (merged["Forecast"] * merged["System imbalance"] > 0)
-            merged["InRange"] = merged["has_range"] & ((merged["imbalanceprice"] >= merged["cap_min"]) & (merged["imbalanceprice"] <= merged["cap_max"]))
-            return merged
-
-        def compute_all_metrics(merged):
-            n_total = len(merged)
-            acc_forecast = round(merged["CorrectForecast"].mean() * 100, 1) if n_total else None
-            subset_range = merged[merged["has_range"]]
-            acc_range_global = round(subset_range["InRange"].mean() * 100, 1) if len(subset_range) else None
-            subset_cf = subset_range[subset_range["CorrectForecast"]]
-            acc_range_when_cf = round(subset_cf["InRange"].mean() * 100, 1) if len(subset_cf) else None
-            corr = round(merged["Forecast"].corr(merged["System imbalance"]), 3)
-            return {"Forecast accuracy": acc_forecast,"Range accuracy": acc_range_global,"Range accuracy – when forecast correct": acc_range_when_cf,"Correlation": corr}
-
-        def plot_bloomberg_dashboard_points(merged, metrics):
-            fig = sp.make_subplots(rows=3, cols=1,row_heights=[0.6, 0.25, 0.6], specs=[[{}],[{}],[{}]], vertical_spacing=0.15,subplot_titles=["Price Range Accuracy (all QH)", None, "System Imbalance vs Forecast"])
-            color_bg="#0b0e16"; color_fill="rgba(0,150,255,0.15)"; color_inrange="deepskyblue"; color_outrange="orange"; color_bar_system="rgba(0,212,255,0.55)"; color_bar_forecast="rgba(255, 204, 0, 0.55)"; color_grid="rgba(255,255,255,0.08)"
-            rng=merged[merged["has_range"]].sort_values("Datetime")
-            fig.add_trace(go.Scatter(x=pd.Series(list(rng["Datetime"])+list(rng["Datetime"][::-1])),y=pd.Series(list(rng["cap_min"])+list(rng["cap_max"][::-1])),fill="toself",fillcolor=color_fill,line=dict(color="rgba(0,0,0,0)"),hoverinfo="skip",name="Price Range"),row=1,col=1)
-            fig.add_trace(go.Scatter(x=merged["Datetime"][merged["InRange"]],y=merged["imbalanceprice"][merged["InRange"]],mode="markers",marker=dict(color=color_inrange,size=7),name="In range"),row=1,col=1)
-            fig.add_trace(go.Scatter(x=merged["Datetime"][~merged["InRange"]],y=merged["imbalanceprice"][~merged["InRange"]],mode="markers",marker=dict(color=color_outrange,size=7,symbol="x"),name="Out of range"),row=1,col=1)
-            kpi_titles=list(metrics.keys());kpi_values=list(metrics.values());positions=[0.15,0.42,0.68,0.90]
-            for i,(title,val) in enumerate(zip(kpi_titles,kpi_values)):
-                title_wrapped=title.replace(" – ","<br>");val_txt=f"{val}%" if isinstance(val,(float,int)) else str(val)
-                fig.add_annotation(xref="paper",yref="paper",x=positions[i],y=0.42,text=f"<b style='font-size:22px;color:white'>{val_txt}</b><br><span style='font-size:14px;color:#cccccc'>{title_wrapped}</span>",showarrow=False,xanchor="center",align="center")
-            ms=merged.sort_values("Datetime")
-            fig.add_trace(go.Bar(x=ms["Datetime"],y=ms["System imbalance"],marker_color=color_bar_system,opacity=0.6,name="System"),row=3,col=1)
-            fig.add_trace(go.Bar(x=ms["Datetime"],y=ms["Forecast"],marker_color=color_bar_forecast,opacity=0.5,name="Forecast"),row=3,col=1)
-            fig.update_layout(template="plotly_dark",paper_bgcolor=color_bg,plot_bgcolor=color_bg,font=dict(color="white",family="Segoe UI"),height=950,hovermode="x unified",title="⚡ aFRR Forecast Dashboard — Bloomberg Style")
-            fig.update_xaxes(showgrid=True,gridcolor=color_grid);fig.update_yaxes(showgrid=True,gridcolor=color_grid)
-            return fig
-
-        forecasts_df=load_forecasts_any_format(CSV_PATH,start,end)
-        actuals_df=fetch_actuals_combined(start,end)
+        end_ts_db = pd.Timestamp(end) + pd.Timedelta(days=1)
+        forecasts_df=load_forecasts(CSV_PATH,start,end)
+        actuals_df=fetch_actuals_combined(start, end_ts_db)
         merged=merge_and_flags(forecasts_df,actuals_df)
         metrics=compute_all_metrics(merged)
         fig=plot_bloomberg_dashboard_points(merged,metrics)
@@ -256,6 +309,174 @@ def dashboard_bloomberg():
 
     except Exception as e:
         return f"<h3>Erreur Dashboard Bloomberg : {e}</h3>"
+
+# --------------------------------------------------------------------------------------
+# EVALUATION DASHBOARD
+# --------------------------------------------------------------------------------------
+def _kpi_cards(kpis):
+    cards = "".join(f"""
+    <div style="background:#11182b;border:1px solid #1e2a3a;border-radius:10px;
+                padding:16px 28px;text-align:center;min-width:150px">
+      <div style="font-size:26px;font-weight:bold;color:{c}">{v}</div>
+      <div style="font-size:12px;color:#aaa;margin-top:6px">{l}</div>
+    </div>""" for l, v, c in kpis)
+    return f'<div style="display:flex;gap:16px;flex-wrap:wrap;justify-content:center;margin:20px 0">{cards}</div>'
+
+
+def _eval_page(start, end, tab, elia_kpi, elia_fig, rte_kpi, rte_fig):
+    elia_disp  = "block" if tab == "elia" else "none"
+    rte_disp   = "block" if tab == "rte"  else "none"
+    elia_cls   = "tab-active" if tab == "elia" else ""
+    rte_cls    = "tab-active" if tab == "rte"  else ""
+    return f"""<!DOCTYPE html><html><head><meta charset="utf-8">
+<title>Evaluation Dashboard</title>
+<script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+<style>
+  body{{margin:0;padding:0;background:#0b0e16;color:white;font-family:'Segoe UI',Arial,sans-serif}}
+  .hdr{{background:#0d1120;border-bottom:1px solid #1e2a3a;padding:14px 28px;
+        display:flex;align-items:center;gap:20px;flex-wrap:wrap}}
+  .hdr h1{{margin:0;font-size:18px;color:deepskyblue}}
+  .tabs{{display:flex;gap:8px;padding:16px 28px 0}}
+  .tab-btn{{background:#11182b;border:1px solid #1e2a3a;border-bottom:none;
+            border-radius:8px 8px 0 0;padding:9px 26px;color:#aaa;
+            cursor:pointer;font-size:13px;font-weight:bold;transition:all .15s}}
+  .tab-btn.tab-active,.tab-btn:hover{{background:#0b0e16;color:white;border-color:#00bfff}}
+  .tab-content{{padding:16px 28px 32px}}
+  input[type=date]{{padding:6px 10px;border-radius:6px;border:1px solid #00bfff;
+                   background:#11182b;color:white;font-size:13px}}
+  .btn{{background:deepskyblue;border:none;border-radius:6px;padding:7px 16px;
+        color:#000;font-weight:bold;cursor:pointer;font-size:13px}}
+  .btn:hover{{background:#00a0e0}}
+  hr{{border:none;border-top:1px solid #1e2a3a;margin:20px 0}}
+</style></head><body>
+<div class="hdr">
+  <h1>⚡ Evaluation Dashboard</h1>
+  <form method="get" action="/evaluation" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+    <input type="hidden" name="tab" value="{tab}">
+    <label style="font-size:13px;color:#aaa">Du</label>
+    <input type="date" name="start" value="{start}">
+    <label style="font-size:13px;color:#aaa">au</label>
+    <input type="date" name="end" value="{end}">
+    <button class="btn" type="submit">Appliquer</button>
+  </form>
+  <a href="/" style="color:#aaa;font-size:13px;margin-left:auto;text-decoration:none">← Accueil</a>
+</div>
+<div class="tabs">
+  <button class="tab-btn {elia_cls}" onclick="switchTab('elia')">⚡ Elia BE</button>
+  <button class="tab-btn {rte_cls}"  onclick="switchTab('rte')">🇫🇷 RTE FR</button>
+</div>
+<div id="tab-elia" class="tab-content" style="display:{elia_disp}">{elia_kpi}<hr>{elia_fig}</div>
+<div id="tab-rte"  class="tab-content" style="display:{rte_disp}">{rte_kpi}<hr>{rte_fig}</div>
+<script>
+function switchTab(n){{
+  document.getElementById('tab-elia').style.display=n==='elia'?'block':'none';
+  document.getElementById('tab-rte').style.display=n==='rte'?'block':'none';
+  document.querySelectorAll('.tab-btn').forEach(function(b,i){{
+    b.classList.toggle('tab-active',(i===0&&n==='elia')||(i===1&&n==='rte'));
+  }});
+  var u=new URL(window.location);u.searchParams.set('tab',n);
+  window.history.replaceState(null,'',u);
+}}
+</script></body></html>"""
+
+
+@app.route("/evaluation")
+def evaluation_dashboard():
+    try:
+        tab   = request.args.get("tab", "elia")
+        start = request.args.get("start", "")
+        end   = request.args.get("end", "")
+        if not start or not end:
+            now = datetime.now(BRUSSELS)
+            end   = now.strftime("%Y-%m-%d")
+            start = (now - timedelta(days=30)).strftime("%Y-%m-%d")
+
+        BG   = "#0b0e16"
+        GRID = "rgba(255,255,255,0.08)"
+        LAY  = dict(template="plotly_dark", paper_bgcolor=BG, plot_bgcolor=BG,
+                    font=dict(color="white", family="Segoe UI"), hovermode="x unified")
+        start_ts = pd.Timestamp(start)
+        end_ts   = pd.Timestamp(end) + pd.Timedelta(days=1)
+
+        # ── ELIA ────────────────────────────────────────────────────────────
+        elia_kpi = elia_fig = ""
+        elia_path = BASE_DIR / "forecast_log_full.csv"
+        if elia_path.exists():
+            de = pd.read_csv(elia_path, parse_dates=["forecast_time"])
+            de = de[(de["forecast_time"] >= start_ts) & (de["forecast_time"] < end_ts)]
+            de = de.rename(columns={
+                "forecast_value": "Forecast",
+                "forecast_time":  "Datetime",
+                "price_min":      "cap_BE",
+                "price_max":      "cap_EU",
+            })
+            actuals_e = fetch_actuals_combined(start_ts, end_ts)
+            merged_e  = merge_and_flags(de, actuals_e)
+            metrics_e = compute_all_metrics(merged_e)
+
+            def _fmt_pct(v):
+                return f"{v:.1f}%" if v is not None else "N/A"
+
+            elia_kpi = _kpi_cards([
+                ("Forecast Accuracy",         _fmt_pct(metrics_e["Forecast accuracy"]),                      "deepskyblue"),
+                ("Range Accuracy",            _fmt_pct(metrics_e["Range accuracy"]),                         "orange"),
+                ("Range Acc. (fcst correct)", _fmt_pct(metrics_e["Range accuracy – when forecast correct"]), "lime"),
+                ("Correlation",               str(metrics_e["Correlation"]) if metrics_e["Correlation"] is not None else "N/A", "#aaa"),
+            ])
+
+            fig_e = plot_bloomberg_dashboard_points(merged_e, metrics_e)
+            elia_fig = fig_e.to_html(full_html=False, include_plotlyjs=False)
+        else:
+            elia_fig = "<p style='color:#999'>forecast_log_full.csv introuvable.</p>"
+
+        # ── RTE ─────────────────────────────────────────────────────────────
+        rte_kpi = rte_fig = ""
+        rte_path = BASE_DIR.parent / "rte_forecaster" / "forecast_log_full.csv"
+        if rte_path.exists():
+            dr = pd.read_csv(rte_path, parse_dates=["timestamp"])
+            dr = dr[(dr["timestamp"] >= start_ts) & (dr["timestamp"] < end_ts)].sort_values("timestamp")
+
+            valid_r = dr.dropna(subset=["actual_mwh"])
+            if len(valid_r):
+                dir_acc_r = (np.sign(valid_r["forecast_mwh"]) == np.sign(valid_r["actual_mwh"])).mean() * 100
+                mae_r     = (valid_r["forecast_mwh"] - valid_r["actual_mwh"]).abs().mean()
+                cut30_r   = valid_r["timestamp"].max() - pd.Timedelta(days=30)
+                rec30_r   = valid_r[valid_r["timestamp"] >= cut30_r]
+                da30_r    = (np.sign(rec30_r["forecast_mwh"]) == np.sign(rec30_r["actual_mwh"])).mean() * 100 if len(rec30_r) else float("nan")
+            else:
+                dir_acc_r = mae_r = da30_r = float("nan")
+
+            rte_kpi = _kpi_cards([
+                ("Direction Accuracy", f"{dir_acc_r:.1f}%" if not np.isnan(dir_acc_r) else "N/A", "deepskyblue"),
+                ("MAE",                f"{mae_r:.1f} MWh"  if not np.isnan(mae_r)     else "N/A", "orange"),
+                ("Dir. Acc. 30j",      f"{da30_r:.1f}%"    if not np.isnan(da30_r)    else "N/A", "lime"),
+                ("QHs valides",        f"{len(valid_r):,}", "#aaa"),
+            ])
+
+            fr = go.Figure()
+            fr.add_trace(go.Scatter(x=dr["timestamp"], y=dr["forecast_mwh"],
+                                     mode="lines", name="Forecast",
+                                     line=dict(color="deepskyblue", width=1)))
+            if not valid_r.empty:
+                fr.add_trace(go.Scatter(x=valid_r["timestamp"], y=valid_r["actual_mwh"],
+                                         mode="lines", name="Réel",
+                                         line=dict(color="white", width=1)))
+            fr.update_layout(**LAY, height=500,
+                              title="🇫🇷 RTE FR — Évaluation du modèle")
+            fr.update_xaxes(showgrid=True, gridcolor=GRID)
+            fr.update_yaxes(showgrid=True, gridcolor=GRID)
+            rte_fig = fr.to_html(full_html=False, include_plotlyjs=False)
+        else:
+            rte_fig = "<p style='color:#999'>forecast_log_full.csv introuvable.</p>"
+
+        return _eval_page(start=start, end=end, tab=tab,
+                          elia_kpi=elia_kpi, elia_fig=elia_fig,
+                          rte_kpi=rte_kpi,   rte_fig=rte_fig)
+
+    except Exception as e:
+        import traceback
+        return (f"<pre style='color:red;background:#0b0e16;padding:20px'>"
+                f"{traceback.format_exc()}</pre>")
 
 # --------------------------------------------------------------------------------------
 # API ELIA
@@ -285,24 +506,27 @@ def fetch_and_process_data(ws_bxl, we_bxl):
 # MERIT ORDER
 # --------------------------------------------------------------------------------------
 def build_merit_orders_silent():
+    import concurrent.futures
     try:
-        import sys
-        from io import StringIO
-        
-        old_stdout = sys.stdout
-        sys.stdout = StringIO()
-        
-        try:
-            from afrr_merit_order import load_and_build
-            path_all, path_de = load_and_build()
-            sys.stdout = old_stdout
-            return path_all, path_de
-        except Exception as e:
-            sys.stdout = old_stdout
-            print(f"  [WARN] Erreur construction merit orders: {e}")
-            return None, None
+        from afrr_merit_order import load_and_build
     except Exception as e:
-        print(f"  [WARN] Erreur import afrr_merit_order: {e}")
+        print(f"  [WARN] Erreur import afrr_merit_order: {e}", flush=True)
+        return None, None
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+            future = ex.submit(load_and_build)
+            try:
+                path_all, path_de = future.result(timeout=120)
+                return path_all, path_de
+            except concurrent.futures.TimeoutError:
+                print("  [WARN] build_merit_orders timeout (120s), skip.", flush=True)
+                return None, None
+            except Exception as e:
+                print(f"  [WARN] Erreur construction merit orders: {e}", flush=True)
+                return None, None
+    except Exception as e:
+        print(f"  [WARN] Erreur build_merit_orders: {e}", flush=True)
         return None, None
 
 # --------------------------------------------------------------------------------------
@@ -620,11 +844,11 @@ def continuous_data_collection_loop():
         wait_until(merit_order_time)
         
         print_separator()
-        print(f"[TIME] {datetime.now(BRUSSELS).strftime('%H:%M:%S')} | Target QH: {next_qh.strftime('%H:%M')}")
+        print(f"[TIME] {datetime.now(BRUSSELS).strftime('%H:%M:%S')} | Target QH: {next_qh.strftime('%H:%M')}", flush=True)
         print_section("CONSTRUCTION MERIT ORDERS")
-        
+
         build_merit_orders_silent()
-        print("  [OK] Piles EU construites")
+        print("  [OK] Piles EU construites", flush=True)
         
         forecast_time = next_qh - timedelta(seconds=30)
         wait_until(forecast_time)
@@ -711,9 +935,168 @@ def continuous_data_collection_loop():
         }).to_csv("forecastV3.csv", mode="a", header=not os.path.exists("forecastV3.csv"), index=False)
         
         print(f"\n  [OK] Forecast enregistre dans forecastV3.csv")
-        print("="*80 + "\n")
-        
+        print("="*80 + "\n", flush=True)
+
         wait_until(next_qh + timedelta(minutes=1))
+
+# --------------------------------------------------------------------------------------
+# RTE FR DASHBOARD
+# --------------------------------------------------------------------------------------
+RTE_LOG_CSV  = BASE_DIR.parent / "rte_forecaster" / "forecast_log_full.csv"
+RTE_DIR_PATH = BASE_DIR.parent / "rte_forecaster"
+
+_rte_token      = None
+_rte_token_time = None
+
+def _rte_fresh_token():
+    global _rte_token, _rte_token_time
+    import base64
+    RTE_CLIENT_ID     = "bdc03388-6c93-46f6-adbf-1a77d5b89684"
+    RTE_CLIENT_SECRET = "da352352-63f8-42ce-9a34-0624f7560a72"
+    if (_rte_token is None or _rte_token_time is None or
+            (datetime.now() - _rte_token_time).total_seconds() > 3000):
+        basic = base64.b64encode(
+            (RTE_CLIENT_ID + ":" + RTE_CLIENT_SECRET).encode()).decode()
+        r = requests.post(
+            "https://digital.iservices.rte-france.com/token/oauth/",
+            headers={"Content-Type": "application/x-www-form-urlencoded",
+                     "Authorization": "Basic " + basic},
+            data={"grant_type": "client_credentials"}, timeout=30)
+        r.raise_for_status()
+        _rte_token      = r.json()["access_token"]
+        _rte_token_time = datetime.now()
+    return _rte_token
+
+
+def _rte_download_actuals(start_dt: datetime, end_dt: datetime) -> pd.DataFrame:
+    import io as _io
+    tok = _rte_fresh_token()
+    url = "https://digital.iservices.rte-france.com/open_api/balancing_energy/v4/imbalance_data"
+    params = {
+        "start_date": start_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "end_date":   end_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "resolution": "PT15M",
+    }
+    r = requests.get(url, params=params,
+                     headers={"Authorization": "Bearer " + tok, "Accept": "text/csv"},
+                     timeout=60)
+    r.raise_for_status()
+    lines = r.text.splitlines()
+    idx = next((i for i, l in enumerate(lines) if l.startswith("Heure de")), None)
+    if idx is None:
+        return pd.DataFrame()
+    df = pd.read_csv(_io.StringIO("\n".join(lines[idx:])), sep=";")
+    df.columns = ["start_time", "end_time", "imbalance_mwh", "trend", "price_pos", "price_neg"]
+    df["start_time"]    = pd.to_datetime(df["start_time"], format="%d/%m/%Y %H:%M")
+    df["imbalance_mwh"] = pd.to_numeric(df["imbalance_mwh"], errors="coerce")
+    return df.set_index("start_time")[["imbalance_mwh"]]
+
+
+@app.route("/dashboard_rte")
+def dashboard_rte():
+    try:
+        start = request.args.get("start")
+        end   = request.args.get("end")
+        if not start or not end:
+            now   = datetime.now(BRUSSELS)
+            end   = now.strftime("%Y-%m-%d")
+            start = (now - timedelta(days=30)).strftime("%Y-%m-%d")
+
+        start_ts = pd.Timestamp(start)
+        end_ts   = pd.Timestamp(end) + pd.Timedelta(days=1)
+
+        df = pd.read_csv(RTE_LOG_CSV, parse_dates=["timestamp"])
+        df = (df[(df["timestamp"] >= start_ts) & (df["timestamp"] < end_ts)]
+                .sort_values("timestamp")
+                .reset_index(drop=True))
+
+        # Fill recent missing actual_mwh from RTE API (last 7 days only to stay fast)
+        cutoff = pd.Timestamp.now() - pd.Timedelta(days=7)
+        need_actual = df[(df["actual_mwh"].isna()) & (df["timestamp"] >= cutoff)]
+        if not need_actual.empty:
+            try:
+                api_start = need_actual["timestamp"].min().to_pydatetime()
+                api_end   = (need_actual["timestamp"].max() + pd.Timedelta(minutes=15)).to_pydatetime()
+                fetched   = _rte_download_actuals(api_start, api_end)
+                if not fetched.empty:
+                    df = df.set_index("timestamp")
+                    df.loc[df["actual_mwh"].isna() & df.index.isin(fetched.index),
+                           "actual_mwh"] = fetched["imbalance_mwh"]
+                    df = df.reset_index()
+            except Exception as e:
+                print(f"[RTE][WARN] actuals fetch failed: {e}")
+
+        valid = df.dropna(subset=["actual_mwh"])
+
+        # KPIs
+        if len(valid):
+            dir_acc = (np.sign(valid["forecast_mwh"]) == np.sign(valid["actual_mwh"])).mean() * 100
+            mae     = (valid["forecast_mwh"] - valid["actual_mwh"]).abs().mean()
+            corr    = round(float(valid["forecast_mwh"].corr(valid["actual_mwh"])), 3)
+            cut30   = valid["timestamp"].max() - pd.Timedelta(days=30)
+            rec30   = valid[valid["timestamp"] >= cut30]
+            da30    = (np.sign(rec30["forecast_mwh"]) == np.sign(rec30["actual_mwh"])).mean() * 100 if len(rec30) else float("nan")
+        else:
+            dir_acc = mae = corr = da30 = float("nan")
+
+        kpis = {
+            "Direction Accuracy":        f"{dir_acc:.1f}%" if not np.isnan(dir_acc) else "N/A",
+            "MAE":                        f"{mae:.1f} MWh"  if not np.isnan(mae)     else "N/A",
+            "Rolling 30d Dir. Accuracy":  f"{da30:.1f}%"    if not np.isnan(da30)    else "N/A",
+            "Correlation":                str(corr)          if not np.isnan(corr)    else "N/A",
+        }
+
+        color_bg   = "#0b0e16"
+        color_grid = "rgba(255,255,255,0.08)"
+
+        fig = sp.make_subplots(
+            rows=2, cols=1,
+            row_heights=[0.75, 0.25],
+            vertical_spacing=0.12,
+            subplot_titles=["🇫🇷 RTE FR — Forecast vs Actual", None],
+        )
+
+        # Row 1: forecast bars + actual line
+        fig.add_trace(go.Bar(
+            x=df["timestamp"], y=df["forecast_mwh"],
+            marker_color="deepskyblue", opacity=0.6, name="Forecast MWh",
+        ), row=1, col=1)
+        if not valid.empty:
+            fig.add_trace(go.Scatter(
+                x=valid["timestamp"], y=valid["actual_mwh"],
+                mode="lines", line=dict(color="white", width=1.5), name="Actual MWh",
+            ), row=1, col=1)
+
+        # Row 2: KPI annotations
+        positions = [0.12, 0.38, 0.65, 0.88]
+        for i, (title, val) in enumerate(kpis.items()):
+            fig.add_annotation(
+                xref="paper", yref="paper",
+                x=positions[i], y=0.08,
+                text=(f"<b style='font-size:22px;color:white'>{val}</b>"
+                      f"<br><span style='font-size:13px;color:#cccccc'>{title}</span>"),
+                showarrow=False, xanchor="center", align="center",
+            )
+
+        fig.update_layout(
+            template="plotly_dark",
+            paper_bgcolor=color_bg, plot_bgcolor=color_bg,
+            font=dict(color="white", family="Segoe UI"),
+            height=800,
+            hovermode="x unified",
+            title=f"⚡ RTE FR Forecast Dashboard — {start} → {end}",
+            bargap=0.1,
+        )
+        fig.update_xaxes(showgrid=True, gridcolor=color_grid)
+        fig.update_yaxes(showgrid=True, gridcolor=color_grid, title_text="MWh", row=1, col=1)
+
+        return fig.to_html(full_html=True, include_plotlyjs="cdn")
+
+    except Exception as e:
+        import traceback
+        return (f"<pre style='color:red;background:#0b0e16;padding:20px'>"
+                f"{traceback.format_exc()}</pre>")
+
 
 # --------------------------------------------------------------------------------------
 # STARTUP
