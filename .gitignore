@@ -79,3 +79,6 @@ outputs/**
 # Temporary
 *.tmp
 *.bak
+*.xlsx
+_tmp_*
+.claude/
