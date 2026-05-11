@@ -206,7 +206,7 @@ def save_summary(results, errors):
     rows = []
     for date_str, grp in df_all.groupby("date"):
         row = {"date": date_str}
-        for s in ["s1", "s2a", "s2", "s3", "s4"]:
+        for s in ["s1", "s3"]:
             row[f"{s}_total"] = grp[f"{s}_total"].sum()
             row[f"{s}_da"]    = grp[f"{s}_revenue_da"].sum()
             row[f"{s}_imb"]   = grp[f"{s}_revenue_imb"].sum()
@@ -224,7 +224,7 @@ def save_summary(results, errors):
 
 def main():
     print(SEP)
-    print("  SIMULATION SOLAIRE FR 2025  --  S1/S2/S3/S4")
+    print("  SIMULATION SOLAIRE FR 2025  --  S1 / S3")
     print(f"  Periode : {START_DATE} -> {END_DATE}")
     print(f"  Data    : {DATA_2025}")
     print(f"  Outputs : {RESULTS_DIR}")
@@ -277,11 +277,10 @@ def main():
         results.append(df_day)
 
         n_sol = int((df_day["production_mw"] > 0.01).sum())
-        vals  = {k: df_day[f"{k}_total"].sum() for k in ["s1","s2a","s2","s3","s4"]}
-        best  = max(vals, key=vals.get).upper()
-        print(f"    {date_str}: {n_sol} QH sol  "
-              f"S1={vals['s1']:+.0f}  S2a={vals['s2a']:+.0f}  S2={vals['s2']:+.0f}  "
-              f"S3={vals['s3']:+.0f}  S4={vals['s4']:+.0f}  best={best}")
+        s1 = df_day["s1_total"].sum()
+        s3 = df_day["s3_total"].sum()
+        best = "S1" if s1 >= s3 else "S3"
+        print(f"    {date_str}: {n_sol} QH sol  S1={s1:+.0f}  S3={s3:+.0f}  best={best}")
 
         if (i + 1) % 14 == 0 or i == len(all_dates) - 1:
             save_summary(results, errors)
@@ -301,18 +300,14 @@ def main():
     df_all["month"] = pd.to_datetime(df_all["timestamp"]).dt.to_period("M").astype(str)
     print()
     for mois in sorted(df_all["month"].unique()):
-        dm   = df_all[df_all["month"] == mois]
-        vals = {k: dm[f"{k}_total"].sum() for k in ["s1","s2a","s2","s3","s4"]}
-        best = max(vals, key=vals.get).upper()
-        print(f"  {mois}  " + "  ".join(f"{k.upper()}={vals[k]:+7.0f}"
-              for k in ["s1","s2a","s2","s3","s4"]) + f"  best={best}")
+        dm  = df_all[df_all["month"] == mois]
+        s1  = dm["s1_total"].sum()
+        s3  = dm["s3_total"].sum()
+        best = "S1" if s1 >= s3 else "S3"
+        print(f"  {mois}  S1={s1:+7.0f}  S3={s3:+7.0f}  best={best}")
 
     print()
-    for s, name in [("s1", "S1 Baseline          "),
-                    ("s2a","S2 Active (DA-only)  "),
-                    ("s2", "S2b DA-adapt+curt150MW"),
-                    ("s3", "S3 50%fix+curt150MW  "),
-                    ("s4", "S4 DA-adapt+curt100MW")]:
+    for s, name in [("s1","S1 Baseline        "), ("s3","S3 50%fix+curt150MW")]:
         tot = df_all[f"{s}_total"].sum()
         da  = df_all[f"{s}_revenue_da"].sum()
         imb = df_all[f"{s}_revenue_imb"].sum()

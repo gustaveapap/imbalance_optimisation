@@ -549,11 +549,7 @@ def compute_strategies_v2(df):
     # Gate nuit
     solar_on = prod > 0.01
 
-    # Nomination DA commune S2/S4
-    nom_da = np.where(da < 0, 0.0,
-             np.where(da < SEUIL_DA_MID, fp * 0.5, fp))
-
-    # Signals DOWN uniquement (signal_UP supprime)
+    # Signal DOWN : risque prix négatifs (curtailment)
     def sig_dn(thr):
         return (
             solar_on
@@ -565,11 +561,9 @@ def compute_strategies_v2(df):
         )
 
     sd150 = sig_dn(150)
-    sd100 = sig_dn(100)
     df["signal_down_150"] = sd150
-    df["signal_down_100"] = sd100
 
-    # S1 Baseline
+    # S1 Baseline — nomination 100%, pas d'ajustement
     df["s1_nomination"]  = fp.values
     df["s1_production"]  = prod.values
     df["s1_ecart"]       = (fp - prod).values
@@ -577,26 +571,7 @@ def compute_strategies_v2(df):
     df["s1_revenue_da"]  = (fp * da / 4).values
     df["s1_total"]       = df["s1_revenue_da"] + df["s1_revenue_imb"]
 
-    # S2a Active — DA-adapt nomination only, NO curtailment
-    df["s2a_nomination"]  = nom_da
-    df["s2a_production"]  = prod.values
-    df["s2a_curtail"]     = False
-    df["s2a_ecart"]       = nom_da - prod.values
-    df["s2a_revenue_imb"] = rev_imb_fr(df["s2a_ecart"].values, ppos, pneg)
-    df["s2a_revenue_da"]  = nom_da * da / 4
-    df["s2a_total"]       = df["s2a_revenue_da"] + df["s2a_revenue_imb"]
-
-    # S2 DA-adapt + curtail DOWN > 150 MW (gate: nomination > 0)
-    curtail_s2 = sd150 & (nom_da > 0)
-    df["s2_curtail"]     = curtail_s2
-    df["s2_nomination"]  = nom_da
-    df["s2_production"]  = np.where(curtail_s2, 0.0, prod)
-    df["s2_ecart"]       = nom_da - df["s2_production"]
-    df["s2_revenue_imb"] = rev_imb_fr(df["s2_ecart"].values, ppos, pneg)
-    df["s2_revenue_da"]  = nom_da * da / 4
-    df["s2_total"]       = df["s2_revenue_da"] + df["s2_revenue_imb"]
-
-    # S3 50% fixe + curtail DOWN > 150 MW
+    # S3 Active — nomination 50% fixe + curtail sur signal DOWN > 150 MW
     curtail_s3 = sd150 & solar_on
     df["s3_curtail"]     = curtail_s3
     nom_s3               = (fp * 0.5).values
@@ -606,16 +581,6 @@ def compute_strategies_v2(df):
     df["s3_revenue_imb"] = rev_imb_fr(df["s3_ecart"].values, ppos, pneg)
     df["s3_revenue_da"]  = nom_s3 * da / 4
     df["s3_total"]       = df["s3_revenue_da"] + df["s3_revenue_imb"]
-
-    # S4 DA-adapt + curtail DOWN > 100 MW (gate: nomination > 0)
-    curtail_s4 = sd100 & (nom_da > 0)
-    df["s4_curtail"]     = curtail_s4
-    df["s4_nomination"]  = nom_da
-    df["s4_production"]  = np.where(curtail_s4, 0.0, prod)
-    df["s4_ecart"]       = nom_da - df["s4_production"]
-    df["s4_revenue_imb"] = rev_imb_fr(df["s4_ecart"].values, ppos, pneg)
-    df["s4_revenue_da"]  = nom_da * da / 4
-    df["s4_total"]       = df["s4_revenue_da"] + df["s4_revenue_imb"]
 
     return df
 
