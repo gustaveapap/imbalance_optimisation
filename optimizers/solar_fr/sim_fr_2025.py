@@ -206,7 +206,7 @@ def save_summary(results, errors):
     rows = []
     for date_str, grp in df_all.groupby("date"):
         row = {"date": date_str}
-        for s in ["s1", "s2", "s3", "s4"]:
+        for s in ["s1", "s2a", "s2", "s3", "s4"]:
             row[f"{s}_total"] = grp[f"{s}_total"].sum()
             row[f"{s}_da"]    = grp[f"{s}_revenue_da"].sum()
             row[f"{s}_imb"]   = grp[f"{s}_revenue_imb"].sum()
@@ -276,11 +276,12 @@ def main():
 
         results.append(df_day)
 
-        n_sol     = int((df_day["production_mw"] > 0.01).sum())
-        s1, s2, s3, s4 = (df_day[f"s{k}_total"].sum() for k in [1,2,3,4])
-        best = ["S1","S2","S3","S4"][[s1,s2,s3,s4].index(max(s1,s2,s3,s4))]
+        n_sol = int((df_day["production_mw"] > 0.01).sum())
+        vals  = {k: df_day[f"{k}_total"].sum() for k in ["s1","s2a","s2","s3","s4"]}
+        best  = max(vals, key=vals.get).upper()
         print(f"    {date_str}: {n_sol} QH sol  "
-              f"S1={s1:+.0f}  S2={s2:+.0f}  S3={s3:+.0f}  S4={s4:+.0f}  best={best}")
+              f"S1={vals['s1']:+.0f}  S2a={vals['s2a']:+.0f}  S2={vals['s2']:+.0f}  "
+              f"S3={vals['s3']:+.0f}  S4={vals['s4']:+.0f}  best={best}")
 
         if (i + 1) % 14 == 0 or i == len(all_dates) - 1:
             save_summary(results, errors)
@@ -301,14 +302,17 @@ def main():
     print()
     for mois in sorted(df_all["month"].unique()):
         dm   = df_all[df_all["month"] == mois]
-        vals = [dm[f"s{k}_total"].sum() for k in [1,2,3,4]]
-        best = ["S1","S2","S3","S4"][vals.index(max(vals))]
-        print(f"  {mois}  " + "  ".join(f"S{k}={v:+7.0f}" for k,v in enumerate(vals,1))
-              + f"  best={best}")
+        vals = {k: dm[f"{k}_total"].sum() for k in ["s1","s2a","s2","s3","s4"]}
+        best = max(vals, key=vals.get).upper()
+        print(f"  {mois}  " + "  ".join(f"{k.upper()}={vals[k]:+7.0f}"
+              for k in ["s1","s2a","s2","s3","s4"]) + f"  best={best}")
 
     print()
-    for s, name in [("s1","S1 Baseline      "), ("s2","S2 DA-adapt 150MW"),
-                    ("s3","S3 50%fix  150MW "), ("s4","S4 DA-adapt 100MW")]:
+    for s, name in [("s1", "S1 Baseline          "),
+                    ("s2a","S2 Active (DA-only)  "),
+                    ("s2", "S2b DA-adapt+curt150MW"),
+                    ("s3", "S3 50%fix+curt150MW  "),
+                    ("s4", "S4 DA-adapt+curt100MW")]:
         tot = df_all[f"{s}_total"].sum()
         da  = df_all[f"{s}_revenue_da"].sum()
         imb = df_all[f"{s}_revenue_imb"].sum()

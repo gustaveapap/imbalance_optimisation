@@ -577,6 +577,15 @@ def compute_strategies_v2(df):
     df["s1_revenue_da"]  = (fp * da / 4).values
     df["s1_total"]       = df["s1_revenue_da"] + df["s1_revenue_imb"]
 
+    # S2a Active — DA-adapt nomination only, NO curtailment
+    df["s2a_nomination"]  = nom_da
+    df["s2a_production"]  = prod.values
+    df["s2a_curtail"]     = False
+    df["s2a_ecart"]       = nom_da - prod.values
+    df["s2a_revenue_imb"] = rev_imb_fr(df["s2a_ecart"].values, ppos, pneg)
+    df["s2a_revenue_da"]  = nom_da * da / 4
+    df["s2a_total"]       = df["s2a_revenue_da"] + df["s2a_revenue_imb"]
+
     # S2 DA-adapt + curtail DOWN > 150 MW (gate: nomination > 0)
     curtail_s2 = sd150 & (nom_da > 0)
     df["s2_curtail"]     = curtail_s2
