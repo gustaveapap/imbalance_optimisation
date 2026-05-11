@@ -48,7 +48,7 @@ BASE_URL_ENTSOE_API = "https://web-api.tp.entsoe.eu/api"
 MODEL_PATH    = Path(r"C:\Users\gusta\rte_forecaster\artifacts\fr_imbalance_full_model.pkl")
 FORECAST_FILE = Path(r"C:\Users\gusta\imbalance_optimisation\forecast_volume_ve_2025.csv")
 DATA_DIR      = Path(r"C:\Users\gusta\imbalance_optimisation\data_ve_2025")
-SAVE_DIR      = Path(r"C:\Users\gusta\imbalance_optimisation\simulation_ve_2025_corrige")
+SAVE_DIR      = Path(r"C:\Users\gusta\imbalance_optimisation\simulation_ve_2025_fr")
 DATA_DIR.mkdir(exist_ok=True)
 SAVE_DIR.mkdir(exist_ok=True)
 
@@ -586,15 +586,13 @@ def compute_ratio_negative(df_offers, date_str, label):
 # =============================================================================
 
 def s8v2(row):
-    """Meilleure — calibree sur DE+BE+NL : P(ISP<0)=43.4%"""
-    fv = abs(row.get("forecast_volume", 0) or 0)
+    fv = row.get("forecast_volume", 0) or 0
     return fv > 300 \
         and (row.get("mfrr_ratio_neg", 0) or 0) > 75 \
         and (row.get("afrr_ratio_neg", 0) or 0) > 75
 
 def s8v4(row):
-    """S8v2 + branche DA : P(ISP<0 branche DA)=66.9%"""
-    fv   = abs(row.get("forecast_volume", 0) or 0)
+    fv   = row.get("forecast_volume", 0) or 0
     da   = row.get("price_eur_mwh", np.nan)
     afrr = row.get("afrr_ratio_neg", 0) or 0
     mfrr = row.get("mfrr_ratio_neg", 0) or 0
@@ -604,7 +602,7 @@ def s8v4(row):
 
 def s9_hybrid(row):
     da   = row.get("price_eur_mwh", np.nan)
-    fv   = abs(row.get("forecast_volume", 0) or 0)
+    fv   = row.get("forecast_volume", 0) or 0
     afrr = row.get("afrr_ratio_neg", 0) or 0
     da_ok = not pd.isna(da) and da < 0
     return (da_ok and fv > 150) or (fv > 450 and afrr > 75)
@@ -612,7 +610,7 @@ def s9_hybrid(row):
 def s1_prudent(row):
     mfrr = row.get("mfrr_ratio_neg", 0) or 0
     afrr = row.get("afrr_ratio_neg", 0) or 0
-    vol  = abs(row.get("forecast_volume", 0) or 0)
+    vol  = row.get("forecast_volume", 0) or 0
     if vol > 300 and mfrr > 75 and afrr > 65: return True
     if (mfrr > 95 or afrr > 95) and vol > 50: return True
     if mfrr > 75 and afrr > 75 and vol > 100: return True
@@ -620,8 +618,14 @@ def s1_prudent(row):
 
 def s2_ultra(row):
     mfrr = row.get("mfrr_ratio_neg", 0) or 0
-    vol  = abs(row.get("forecast_volume", 0) or 0)
+    vol  = row.get("forecast_volume", 0) or 0
     return mfrr > 80 or (mfrr > 60 and vol > 250)
+
+def s_be_opt(row):
+    fv   = row.get("forecast_volume", 0) or 0
+    afrr = row.get("afrr_ratio_neg", 0) or 0
+    mfrr = row.get("mfrr_ratio_neg", 0) or 0
+    return fv > 200 and afrr > 50 and mfrr > 50
 
 STRATEGIES = {
     "S8v2":       s8v2,
@@ -629,6 +633,7 @@ STRATEGIES = {
     "S9_Hybrid":  s9_hybrid,
     "S1_Prudent": s1_prudent,
     "S2_Ultra":   s2_ultra,
+    "S_BE_opt":   s_be_opt,
 }
 
 # =============================================================================
@@ -800,7 +805,7 @@ def main():
                 s  += fkw
                 skw = 0.0; triggered = False
                 if smart_window(ts) and s < EV_CAPACITY_KWH:
-                    if abs(row.get("forecast_volume", 0) or 0) > 50:
+                    if (row.get("forecast_volume", 0) or 0) > 50:
                         if fn(row):
                             skw = min(CHARGER_POWER_PER_QH_KWH, EV_CAPACITY_KWH - s)
                             s  += skw; triggered = True
