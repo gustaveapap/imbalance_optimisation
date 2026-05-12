@@ -549,19 +549,22 @@ def compute_strategies_v2(df):
     # Gate nuit
     solar_on = prod > 0.01
 
-    # Signal DOWN : risque prix négatifs (curtailment)
-    def sig_dn(thr):
-        return (
-            solar_on
-            & (fdir == "DOWN")
-            & (
-                ((vol > thr) & (mfrr_neg > 85) & (afrr_neg > 70))
-                | ((vol > thr) & (afrr_vneg > 75))
-            )
+    # Signaux VE eprouves (de simulate_ve_fr_2026.py)
+    # s1_trigger : PRUDENT — conditions multiples volume + mfrr + afrr
+    sd_prudent = (
+        solar_on & (fdir == "DOWN") & (
+            ((vol > 300) & (mfrr_neg > 75) & (afrr_neg > 65))
+            | (((mfrr_neg > 95) | (afrr_neg > 95)) & (vol > 50))
+            | ((mfrr_neg > 75) & (afrr_neg > 75) & (vol > 100))
         )
-
-    sd150 = sig_dn(150)
-    df["signal_down_150"] = sd150
+    )
+    # s2_trigger : ULTRA — seuil mfrr seul ou mfrr + volume
+    sd_ultra = (
+        solar_on & (fdir == "DOWN") & (
+            (mfrr_neg > 80) | ((mfrr_neg > 60) & (vol > 250))
+        )
+    )
+    df["signal_down_150"] = sd_prudent   # colonne conservee pour compatibilite
 
     # S1 Baseline — nomination 100%, pas d'ajustement
     df["s1_nomination"]  = fp.values
@@ -571,9 +574,9 @@ def compute_strategies_v2(df):
     df["s1_revenue_da"]  = (fp * da / 4).values
     df["s1_total"]       = df["s1_revenue_da"] + df["s1_revenue_imb"]
 
-    # S2 Active — nomination DA-adapt + curtail DOWN > 150 MW (même logique production que S3)
-    curtail_s2 = sd150 & solar_on
-    nom_s2     = np.where(da < 0, 0.0, np.where(da < SEUIL_DA_MID, fp * 0.5, fp))
+    # S2 Active — DA-adapt 0%/100% + curtail signal ULTRA (VE s2_trigger)
+    curtail_s2 = sd_ultra & solar_on
+    nom_s2     = np.where(da < 0, 0.0, fp)
     df["s2_curtail"]     = curtail_s2
     df["s2_nomination"]  = nom_s2
     df["s2_production"]  = np.where(curtail_s2, 0.0, prod)
@@ -582,10 +585,10 @@ def compute_strategies_v2(df):
     df["s2_revenue_da"]  = nom_s2 * da / 4
     df["s2_total"]       = df["s2_revenue_da"] + df["s2_revenue_imb"]
 
-    # S3 Active — nomination 50% fixe + curtail DOWN > 150 MW
-    curtail_s3 = sd150 & solar_on
+    # S3 Active — nomination 70% fixe + curtail signal PRUDENT (VE s1_trigger)
+    curtail_s3 = sd_prudent & solar_on
     df["s3_curtail"]     = curtail_s3
-    nom_s3               = (fp * 0.5).values
+    nom_s3               = (fp * 0.7).values
     df["s3_nomination"]  = nom_s3
     df["s3_production"]  = np.where(curtail_s3, 0.0, prod)
     df["s3_ecart"]       = nom_s3 - df["s3_production"]
@@ -614,14 +617,18 @@ def build_forecast_parc(prod, df_solar):
 # FORECAST MODELE FR
 # =============================================================================
 
+_fr_model_cache = {}
+
 def forecast_fr(date_str, df_hist):
     if not MODEL_PATH.exists():
         return None
     if df_hist is None or df_hist.empty:
         return None
     try:
-        model = joblib.load(MODEL_PATH)
-        rows  = []
+        if "model" not in _fr_model_cache:
+            _fr_model_cache["model"] = joblib.load(MODEL_PATH)
+        model = _fr_model_cache["model"]
+        X, valid_ts = [], []
         for ts in qh_range(date_str):
             hist = df_hist[df_hist["timestamp"] < ts].tail(MAX_LAG)
             if len(hist) < MAX_LAG:
@@ -638,10 +645,15 @@ def forecast_fr(date_str, df_hist):
                 np.sin(2*np.pi*ts.dayofweek/7), np.cos(2*np.pi*ts.dayofweek/7),
                 np.sin(2*np.pi*ts.month/12),    np.cos(2*np.pi*ts.month/12),
             ]
-            pred = float(model.predict(np.array(feats).reshape(1, -1))[0])
-            rows.append({"timestamp": ts, "forecast_volume": pred,
-                         "forecast_direction": "DOWN" if pred > 0 else "UP"})
-        return pd.DataFrame(rows) if rows else None
+            X.append(feats)
+            valid_ts.append(ts)
+        if not X:
+            return None
+        preds = model.predict(np.array(X, dtype=np.float32))
+        rows = [{"timestamp": ts, "forecast_volume": float(p),
+                 "forecast_direction": "DOWN" if p > 0 else "UP"}
+                for ts, p in zip(valid_ts, preds)]
+        return pd.DataFrame(rows)
     except Exception as e:
         print(f"    forecast_fr   : WARN {e}")
         return None
