@@ -564,5 +564,101 @@ def main():
         best = ["S1","S2","S3"][vals.index(max(vals))]
         print(f"  {mois}  S1={vals[0]:+7.0f}  S2={vals[1]:+7.0f}  S3={vals[2]:+7.0f}  best={best}")
 
+# =============================================================================
+# MODE CONTINU  (python sim_be_2026.py --continuous)
+# =============================================================================
+
+def run_continuous():
+    """Simule chaque nouveau jour des que les donnees sont disponibles (vers 02:00)."""
+    import sys as _sys
+    print(SEP)
+    print("  SIMULATION SOLAIRE BE 2026 -- MODE CONTINU")
+    print(SEP)
+
+    print("\n  PVGIS BE..."); df_pvgis = dl_pvgis_be()
+
+    while True:
+        today     = datetime.now().date()
+        yesterday = today - timedelta(days=1)
+
+        # Dernier jour simule
+        last_sim = (datetime.strptime(START_DATE, "%Y-%m-%d") - timedelta(days=1)).date()
+        if SUMMARY_FILE.exists():
+            try:
+                df_s = pd.read_csv(SUMMARY_FILE)
+                if not df_s.empty:
+                    last_sim = datetime.strptime(df_s["date"].max(), "%Y-%m-%d").date()
+            except Exception:
+                pass
+
+        new_dates = [d.strftime("%Y-%m-%d")
+                     for d in pd.date_range(
+                         datetime.strptime(START_DATE, "%Y-%m-%d").date(),
+                         yesterday, freq="D")
+                     if d.date() > last_sim]
+
+        if not new_dates:
+            # Attendre demain 02:00
+            wake = datetime.combine(today + timedelta(days=1),
+                                    datetime.min.time()) + timedelta(hours=2)
+            delta = max(300, (wake - datetime.now()).total_seconds())
+            print(f"  [{datetime.now().strftime('%H:%M')}] BE Solar a jour ({last_sim}). "
+                  f"Prochain cycle : {wake.strftime('%Y-%m-%d %H:%M')} ({delta/3600:.1f}h)",
+                  flush=True)
+            time.sleep(delta)
+            continue
+
+        print(f"\n  {len(new_dates)} jours a traiter : {new_dates[0]} -> {new_dates[-1]}")
+
+        # Recharger historique imbalance
+        parts = []
+        for f in sorted(DATA_2025.glob("imbalance_be_2025-*.csv")):
+            try: parts.append(pd.read_csv(f, parse_dates=["timestamp"]))
+            except Exception: pass
+        for f in sorted(DATA_2026.glob("imbalance_be_2026-*.csv")):
+            try: parts.append(pd.read_csv(f, parse_dates=["timestamp"]))
+            except Exception: pass
+        df_hist = (pd.concat(parts, ignore_index=True)
+                   .sort_values("timestamp").drop_duplicates("timestamp")
+                   .reset_index(drop=True)) if parts else pd.DataFrame(columns=["timestamp", "volume"])
+
+        # Charger resultats deja calcules
+        results = []
+        for f in sorted(RESULTS_DIR.glob("day_2026-*.csv")):
+            try: results.append(pd.read_csv(f, parse_dates=["timestamp"]))
+            except Exception: pass
+        errors = []
+
+        for i, date_str in enumerate(new_dates):
+            try:
+                df_day = simulate_day_be_2026(date_str, df_pvgis, df_hist)
+            except Exception as e:
+                print(f"  {date_str} -> ERREUR: {e}")
+                errors.append({"date": date_str, "error": str(e)}); continue
+
+            if df_day is None:
+                print(f"  {date_str} -> donnees manquantes, reessai au prochain cycle")
+                errors.append({"date": date_str, "error": "donnees manquantes"}); continue
+
+            df_hist = (pd.concat([df_hist, df_day[["timestamp", "volume"]].dropna()],
+                                 ignore_index=True)
+                       .sort_values("timestamp").drop_duplicates("timestamp"))
+            results.append(df_day)
+
+            s1 = df_day["s1_total"].sum(); s2 = df_day["s2_total"].sum()
+            s3 = df_day["s3_total"].sum()
+            best = ["S1","S2","S3"][[s1,s2,s3].index(max(s1,s2,s3))]
+            n_sol = int((df_day["production_mw"] > 0.01).sum())
+            print(f"    {date_str}: {n_sol} QH sol  "
+                  f"S1={s1:+.0f}  S2={s2:+.0f}  S3={s3:+.0f}  best={best}", flush=True)
+
+        if results:
+            save_summary(results, errors)
+            print(f"  [SAVE] {len(results)} jours dans summary")
+
 if __name__ == "__main__":
-    main()
+    import sys as _sys
+    if "--continuous" in _sys.argv:
+        run_continuous()
+    else:
+        main()
