@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Comparaison des simulations solaires FR vs BE 2025
+Comparaison des simulations solaires FR vs BE
 Revenue total + par MWh pour S1/S2/S3
+Usage : python compare_fr_be_2025.py [2025|2026]
 """
 
+import sys
 import pandas as pd
 import numpy as np
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
 
-FR_DIR = REPO / "outputs" / "solar_fr" / "simulation_2025"
-BE_DIR = REPO / "outputs" / "solar_be" / "simulation_2025"
+YEAR = sys.argv[1] if len(sys.argv) > 1 else "2025"
+FR_DIR = REPO / "outputs" / "solar_fr" / f"simulation_{YEAR}"
+BE_DIR = REPO / "outputs" / "solar_be" / f"simulation_{YEAR}"
 
 SEP  = "=" * 90
 SEP2 = "-" * 90
@@ -75,7 +78,7 @@ def print_country_table(df, country):
 
 def main():
     print(SEP)
-    print("  COMPARAISON SIMULATION SOLAIRE FR vs BE -- 2025")
+    print(f"  COMPARAISON SIMULATION SOLAIRE FR vs BE -- {YEAR}")
     print(SEP)
 
     print("\n  Chargement FR...")
@@ -92,7 +95,7 @@ def main():
 
     # -- Summary table ------------------------------------------------------- #
     print(f"\n{SEP}")
-    print("  RESUME STRATEGIES -- ANNEE COMPLETE 2025")
+    print(f"  RESUME STRATEGIES -- {YEAR}")
     print(SEP)
 
     print(f"\n  {'Strategie':<26}  {'Total EUR':>11}  {'DA EUR':>11}  {'Imb EUR':>11}"
