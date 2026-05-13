@@ -14,6 +14,7 @@ sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="repla
 
 from datetime import datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 import requests
@@ -91,8 +92,13 @@ def ensure_rte_token():
 def fetch_isp_fr(ts, retries=5, delay=30):
     """Retourne (volume, prix_positif, prix_negatif) pour le QH ts. None si indisponible."""
     ts = pd.Timestamp(ts)
-    s  = ts.strftime("%Y-%m-%dT%H:%M:%S+01:00")
-    e  = (ts + pd.Timedelta(minutes=15)).strftime("%Y-%m-%dT%H:%M:%S+01:00")
+    _tz = ZoneInfo(PARIS)
+    def _fmt(t):
+        aw = t.tz_localize(_tz)
+        off = aw.strftime("%z")  # e.g. +0200 or +0100
+        return t.strftime("%Y-%m-%dT%H:%M:%S") + off[:3] + ":" + off[3:]
+    s  = _fmt(ts)
+    e  = _fmt(ts + pd.Timedelta(minutes=15))
     for attempt in range(retries):
         try:
             token = ensure_rte_token()
