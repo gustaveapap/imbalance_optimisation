@@ -36,7 +36,7 @@ SUMMARY_FILE = RESULTS_DIR / "summary_2026.csv"
 ERRORS_FILE  = RESULTS_DIR / "errors_2026.csv"
 
 START_DATE = "2026-01-01"
-END_DATE   = "2026-05-11"
+END_DATE   = "2026-12-31"
 
 from test_logic_fr import (
     dl_pvgis, dl_solar, pvgis_day,

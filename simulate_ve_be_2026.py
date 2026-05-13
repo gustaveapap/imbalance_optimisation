@@ -3,7 +3,8 @@
 """
 VE BE -- simulation en continu, un QH a la fois.
   ISP          : Elia ODS134 (API temps reel, retries)
-  Merit ratios : data_ve_2026/merit_cache/merit_{date}.csv
+  Merit ratios : fetch live BE+DE+NL via solar_be_scheduler.compute_day_eu_metrics
+                 (cache local merit_cache/merit_{date}.csv en fallback)
   Forecast vol : forecasters/elia_forecaster/forecastV3.csv
 Au demarrage reprend depuis le dernier QH dans outputs/ve_be/simulation_ve_be_2026.csv.
 """
@@ -95,28 +96,56 @@ def fetch_isp_be(ts, retries=5, delay=30):
     return None
 
 # =============================================================================
-# MERIT METRICS (merit_cache local)
+# MERIT METRICS (fetch live BE+DE+NL via API, cache local)
 # =============================================================================
+_merit_day_cache = {}
+
+def _fetch_merit_day(date_str):
+    """Retourne DataFrame 96 QH avec afrr/mfrr_ratio_negative.
+    Lit le cache local si present, sinon fetche live BE+DE+NL via API."""
+    if date_str in _merit_day_cache:
+        return _merit_day_cache[date_str]
+    cache_file = MERIT_CACHE / f"merit_{date_str}.csv"
+    MERIT_CACHE.mkdir(exist_ok=True)
+    if cache_file.exists():
+        try:
+            df = pd.read_csv(cache_file, parse_dates=["timestamp"])
+            df["timestamp"] = pd.to_datetime(df["timestamp"])
+            _merit_day_cache[date_str] = df
+            return df
+        except Exception:
+            pass
+    # Cache absent -> fetch live (BE Elia ODS163/164 + DE regelleistung + NL TenNET)
+    try:
+        import sys as _sys
+        _p = str(REPO / "optimizers" / "solar_be")
+        if _p not in _sys.path:
+            _sys.path.insert(0, _p)
+        from solar_be_scheduler import compute_day_eu_metrics
+        print(f"  [merit] fetch live {date_str} (BE+DE+NL)...", flush=True)
+        df = compute_day_eu_metrics(date_str)
+        df.to_csv(cache_file, index=False)
+        _merit_day_cache[date_str] = df
+        return df
+    except Exception as e:
+        print(f"  WARNING merit live {date_str}: {e}", flush=True)
+        _merit_day_cache[date_str] = pd.DataFrame()
+        return pd.DataFrame()
+
+
 def get_merit_for_qh_be(ts):
-    """Retourne (mfrr_ratio_neg, afrr_ratio_neg) depuis le cache du jour ou du jour-1."""
+    """Retourne (mfrr_ratio_neg, afrr_ratio_neg) — fetch live si cache absent."""
     ts = pd.Timestamp(ts)
     for ds in [ts.strftime("%Y-%m-%d"),
                (ts - pd.Timedelta(days=1)).strftime("%Y-%m-%d")]:
-        cache = MERIT_CACHE / f"merit_{ds}.csv"
-        if not cache.exists():
+        df = _fetch_merit_day(ds)
+        if df.empty:
             continue
-        try:
-            df = pd.read_csv(cache, parse_dates=["timestamp"])
-            df["timestamp"] = pd.to_datetime(df["timestamp"])
-            row = df[df["timestamp"] == ts]
-            if not row.empty:
-                r = row.iloc[0]
-                return (float(r.get("mfrr_ratio_negative", 0) or 0),
-                        float(r.get("afrr_ratio_negative",  0) or 0))
-            if ds == ts.strftime("%Y-%m-%d"):
-                return 0.0, 0.0  # cache du jour present mais QH manquant
-        except Exception:
-            pass
+        row = df[df["timestamp"] == ts]
+        if not row.empty:
+            r = row.iloc[0]
+            return (float(r.get("mfrr_ratio_negative", 0) or 0),
+                    float(r.get("afrr_ratio_negative",  0) or 0))
     return 0.0, 0.0
 
 # =============================================================================
