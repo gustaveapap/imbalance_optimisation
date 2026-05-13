@@ -1091,10 +1091,13 @@ def load_1min_day_hist(date_str: str) -> pd.DataFrame:
     """
     cache = DATA_DIR / f"si_1min_{date_str}.csv"
     if _file_cached(cache, min_size=10_000):
-        df = pd.read_csv(cache, parse_dates=["datetime"])
-        df["actual_system_imbalance"] = pd.to_numeric(
-            df["actual_system_imbalance"], errors="coerce")
-        return df
+        try:
+            df = pd.read_csv(cache, parse_dates=["datetime"])
+            df["actual_system_imbalance"] = pd.to_numeric(
+                df["actual_system_imbalance"], errors="coerce")
+            return df
+        except Exception:
+            cache.unlink(missing_ok=True)  # broken cache → re-download
 
     bx    = pytz.timezone(BRUSSELS)
     s_utc = (pd.Timestamp(date_str)
@@ -1151,8 +1154,11 @@ def load_isp_day_hist(date_str: str) -> pd.Series:
     """
     cache = DATA_DIR / f"isp_{date_str}.csv"
     if _file_cached(cache):
-        df = pd.read_csv(cache, parse_dates=["datetime"])
-        return df.set_index("datetime")["imbalanceprice"]
+        try:
+            df = pd.read_csv(cache, parse_dates=["datetime"])
+            return df.set_index("datetime")["imbalanceprice"]
+        except Exception:
+            cache.unlink(missing_ok=True)  # broken cache → re-download
 
     bx    = pytz.timezone(BRUSSELS)
     s_utc = (pd.Timestamp(date_str)
