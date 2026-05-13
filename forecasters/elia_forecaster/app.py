@@ -484,6 +484,14 @@ def evaluation_dashboard():
 ACTUAL_API_URL = "https://opendata.elia.be/api/explore/v2.1/catalog/datasets/ods169/records"
 data_lock = threading.Lock()
 
+try:
+    historical_data = pd.read_csv("historical_imbalance_data.csv")
+    historical_data["datetime"] = pd.to_datetime(historical_data["datetime"]).dt.tz_localize(None)
+    historical_data = historical_data.set_index("datetime")
+except Exception:
+    historical_data = pd.DataFrame(columns=["actual_system_imbalance"])
+    historical_data.index.name = "datetime"
+
 def fetch_and_process_data(ws_bxl, we_bxl):
     ws_utc = ws_bxl.astimezone(pytz.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     we_utc = we_bxl.astimezone(pytz.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -861,6 +869,7 @@ def continuous_data_collection_loop():
         print(f"  [INFO] Fenetre de recuperation: [{window_start.strftime('%H:%M:%S')} -> {window_end.strftime('%H:%M:%S')}]")
         
         new_data = fetch_and_process_data(window_start, window_end)
+        forecast = np.nan
 
         with data_lock:
             if new_data is not None and not new_data.empty:
