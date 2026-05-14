@@ -28,6 +28,7 @@ DATA_2026         = REPO / "data_ve_2026"
 MERIT_CACHE       = DATA_2026 / "merit_cache"
 FORECAST_LOG_FULL = REPO / "forecasters" / "elia_forecaster" / "forecast_log_full.csv"
 FORECAST_V3       = REPO / "forecasters" / "elia_forecaster" / "forecastV3.csv"
+ISP_BE_LOCAL_DIR  = REPO / "data" / "raw" / "solar_be"
 OUT_QH            = REPO / "outputs" / "ve_be" / "simulation_ve_be_2026.csv"
 OUT_DAILY         = REPO / "outputs" / "ve_be" / "summary_daily_ve_be_2026.csv"
 
@@ -73,7 +74,33 @@ def smart_window(h, is_weekend):
     return (h >= 20) or (h < 10)
 
 # =============================================================================
-# ISP FETCH (ODS162 temps reel, fallback ODS134 historique valide)
+# ISP LOCAL CACHE (data/raw/solar_be/isp_2026-*.csv, chargé une fois au démarrage)
+# =============================================================================
+_isp_be_local: dict = {}  # pd.Timestamp -> float
+
+def _load_isp_be_local():
+    global _isp_be_local
+    if _isp_be_local:
+        return
+    frames = []
+    for f in sorted(ISP_BE_LOCAL_DIR.glob("isp_2026-*.csv")):
+        try:
+            frames.append(pd.read_csv(f, parse_dates=["datetime"]))
+        except Exception:
+            pass
+    if frames:
+        df = pd.concat(frames, ignore_index=True).dropna(subset=["imbalanceprice"])
+        df["datetime"] = pd.to_datetime(df["datetime"])
+        _isp_be_local = dict(zip(df["datetime"], df["imbalanceprice"].astype(float)))
+        mn, mx = min(_isp_be_local), max(_isp_be_local)
+        print(f"  [ISP-BE] {len(_isp_be_local)} QH locaux charges "
+              f"({pd.Timestamp(mn).date()} -> {pd.Timestamp(mx).date()})", flush=True)
+    else:
+        print("  [ISP-BE] Aucun fichier ISP local trouve", flush=True)
+
+
+# =============================================================================
+# ISP FETCH (local d'abord, ODS162/ODS134 uniquement pour QH recents hors cache)
 # =============================================================================
 def _query_isp(dataset, ws, we):
     r = requests.get(ELIA_API, params={
@@ -90,9 +117,12 @@ def _query_isp(dataset, ws, we):
 
 def fetch_isp_be(ts, retries=5, delay=30):
     """Retourne ISP (EUR/MWh) pour le QH ts.
-    Essaie ODS162 (temps reel) puis ODS134 (historique valide).
-    Retourne None si indisponible apres retries."""
+    Cherche d'abord dans le cache local (isp_2026-*.csv).
+    Appel API (ODS162 puis ODS134) uniquement pour les QH hors cache."""
     ts = pd.Timestamp(ts)
+    v = _isp_be_local.get(ts)
+    if v is not None:
+        return v
     ws = (ts.tz_localize(BRUSSELS, nonexistent="shift_forward")
           .tz_convert("UTC").strftime("%Y-%m-%dT%H:%M:%SZ"))
     we = ((ts + pd.Timedelta(minutes=14))
@@ -453,6 +483,10 @@ def main():
     print("=" * 70)
     print("  SIMULATION VE BE -- CONTINU")
     print("=" * 70)
+
+    # Chargement en mémoire au démarrage (une seule fois)
+    _load_isp_be_local()
+    _load_forecast_be()
 
     last_ts, soc = restore_state()
     if last_ts is None:

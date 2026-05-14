@@ -37,6 +37,7 @@ CLIENT_SECRET = "da352352-63f8-42ce-9a34-0624f7560a72"
 RTE_TOKEN_URL = "https://digital.iservices.rte-france.com/token/oauth/"
 RTE_IMB_URL   = "https://digital.iservices.rte-france.com/open_api/balancing_energy/v5/imbalance_data"
 PARIS         = "Europe/Paris"
+_TZ_PARIS     = ZoneInfo(PARIS)
 ENTSOE_API    = "https://web-api.tp.entsoe.eu/api"
 ENTSOE_TOKEN  = "dcc0c513-dab6-4add-82be-7b693f2b7fab"
 FR_DOMAIN     = "10YFR-RTE------C"
@@ -77,6 +78,16 @@ def smart_window(h, is_weekend):
     return (h >= 20) or (h < 10)
 
 # =============================================================================
+# HELPER TIMEZONE PARIS
+# =============================================================================
+def _fmt_paris(t):
+    """Formate un Timestamp naive en ISO8601 avec offset Paris (DST-aware)."""
+    aw  = t.tz_localize(_TZ_PARIS)
+    off = aw.strftime("%z")        # +0200 ou +0100
+    return t.strftime("%Y-%m-%dT%H:%M:%S") + off[:3] + ":" + off[3:]
+
+
+# =============================================================================
 # AUTH RTE
 # =============================================================================
 _rte = {"token": None, "ts": 0}
@@ -94,18 +105,97 @@ def ensure_rte_token():
     return _rte["token"]
 
 # =============================================================================
-# ISP FETCH (RTE API)
+# ISP FR LOCAL CACHE (data_ve_2026/isp_fr_{date}.csv)
+# Bulk-fetch par jour : 1 appel API = 96 QH mis en cache d'un coup.
+# =============================================================================
+_isp_fr_local: dict = {}   # pd.Timestamp -> (volume, prix_pos, prix_neg)
+_isp_fr_days_loaded: set = set()  # jours dont le cache a déjà été tenté
+
+
+def _load_isp_fr_local():
+    """Charge tous les fichiers isp_fr_*.csv existants au démarrage."""
+    for f in sorted(DATA_2026.glob("isp_fr_*.csv")):
+        try:
+            df = pd.read_csv(f, parse_dates=["timestamp"])
+            df["timestamp"] = pd.to_datetime(df["timestamp"])
+            for row in df.itertuples(index=False):
+                _isp_fr_local[row.timestamp] = (
+                    float(row.volume), float(row.prix_pos), float(row.prix_neg))
+            _isp_fr_days_loaded.add(f.stem.replace("isp_fr_", ""))
+        except Exception:
+            pass
+    if _isp_fr_local:
+        mn = min(_isp_fr_local)
+        mx = max(_isp_fr_local)
+        print(f"  [ISP-FR] {len(_isp_fr_local)} QH locaux charges "
+              f"({pd.Timestamp(mn).date()} -> {pd.Timestamp(mx).date()})", flush=True)
+
+
+def _fetch_isp_fr_day_bulk(date_str):
+    """Un seul appel RTE pour tout le jour, sauvegarde dans isp_fr_{date}.csv."""
+    if date_str in _isp_fr_days_loaded:
+        return
+    cache_file = DATA_2026 / f"isp_fr_{date_str}.csv"
+    DATA_2026.mkdir(exist_ok=True)
+    _isp_fr_days_loaded.add(date_str)  # marquer même en cas d'échec pour éviter re-tentatives
+    if cache_file.exists():
+        try:
+            df = pd.read_csv(cache_file, parse_dates=["timestamp"])
+            df["timestamp"] = pd.to_datetime(df["timestamp"])
+            for row in df.itertuples(index=False):
+                _isp_fr_local[row.timestamp] = (
+                    float(row.volume), float(row.prix_pos), float(row.prix_neg))
+            return
+        except Exception:
+            pass
+    # Fetch tout le jour via API
+    try:
+        day_start = pd.Timestamp(f"{date_str} 00:00")
+        day_end   = pd.Timestamp(f"{date_str} 23:45") + pd.Timedelta(minutes=15)
+        token = ensure_rte_token()
+        r = requests.get(RTE_IMB_URL,
+                         headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+                         params={"start_date": _fmt_paris(day_start),
+                                 "end_date":   _fmt_paris(day_end)},
+                         timeout=60)
+        if r.status_code == 401:
+            _rte["token"] = None
+        r.raise_for_status()
+        rows = []
+        for item in r.json().get("imbalance_data", []):
+            for v in item.get("values", []):
+                vts = pd.to_datetime(v.get("start_date"), utc=True, errors="coerce")
+                if pd.isna(vts):
+                    continue
+                vts = vts.tz_convert(PARIS).tz_localize(None).floor("15min")
+                row = {"timestamp": vts,
+                       "volume":    float(v.get("imbalance") or 0),
+                       "prix_pos":  float(v.get("positive_imbalance_settlement_price") or 0),
+                       "prix_neg":  float(v.get("negative_imbalance_settlement_price") or 0)}
+                rows.append(row)
+                _isp_fr_local[vts] = (row["volume"], row["prix_pos"], row["prix_neg"])
+        if rows:
+            pd.DataFrame(rows).to_csv(cache_file, index=False)
+            print(f"  [ISP-FR] {date_str} : {len(rows)} QH cached", flush=True)
+    except Exception as e:
+        print(f"  [ISP-FR] bulk {date_str}: {e}", flush=True)
+
+
+# =============================================================================
+# ISP FETCH (cache local d'abord, bulk-fetch jour si absent, API par QH en fallback)
 # =============================================================================
 def fetch_isp_fr(ts, retries=5, delay=30):
     """Retourne (volume, prix_positif, prix_negatif) pour le QH ts. None si indisponible."""
     ts = pd.Timestamp(ts)
-    _tz = ZoneInfo(PARIS)
-    def _fmt(t):
-        aw = t.tz_localize(_tz)
-        off = aw.strftime("%z")  # e.g. +0200 or +0100
-        return t.strftime("%Y-%m-%dT%H:%M:%S") + off[:3] + ":" + off[3:]
-    s  = _fmt(ts)
-    e  = _fmt(ts + pd.Timedelta(minutes=15))
+    # Cache local (ou bulk-fetch du jour si pas encore chargé)
+    date_str = ts.strftime("%Y-%m-%d")
+    _fetch_isp_fr_day_bulk(date_str)
+    v = _isp_fr_local.get(ts)
+    if v is not None:
+        return v
+    # Fallback per-QH pour les QH très récents pas encore validés par RTE
+    s = _fmt_paris(ts)
+    e = _fmt_paris(ts + pd.Timedelta(minutes=15))
     for attempt in range(retries):
         try:
             token = ensure_rte_token()
@@ -119,15 +209,15 @@ def fetch_isp_fr(ts, retries=5, delay=30):
                 continue
             r.raise_for_status()
             for item in r.json().get("imbalance_data", []):
-                for v in item.get("values", []):
-                    vts = pd.to_datetime(v.get("start_date"), utc=True, errors="coerce")
+                for v2 in item.get("values", []):
+                    vts = pd.to_datetime(v2.get("start_date"), utc=True, errors="coerce")
                     if pd.isna(vts):
                         continue
                     vts = vts.tz_convert(PARIS).tz_localize(None).floor("15min")
                     if vts == ts:
-                        return (float(v.get("imbalance") or 0),
-                                float(v.get("positive_imbalance_settlement_price") or 0),
-                                float(v.get("negative_imbalance_settlement_price") or 0))
+                        return (float(v2.get("imbalance") or 0),
+                                float(v2.get("positive_imbalance_settlement_price") or 0),
+                                float(v2.get("negative_imbalance_settlement_price") or 0))
         except Exception as e:
             print(f"  [ISP-FR] tentative {attempt+1}/{retries}: {e}")
         if attempt < retries - 1:
@@ -478,6 +568,10 @@ def main():
         print("  Auth RTE : OK")
     except Exception as e:
         print(f"  Auth RTE : ECHEC ({e}) -- on continue, reessai au premier QH")
+
+    # Chargement en mémoire au démarrage (une seule fois)
+    _load_isp_fr_local()
+    _load_forecast_fr()
 
     last_ts, soc = restore_state()
     if last_ts is None:
