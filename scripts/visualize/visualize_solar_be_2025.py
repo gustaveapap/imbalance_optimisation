@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-Visualisation Solaire BE 2026 - 2 panneaux
-  Haut : revenus cumulatifs jour par jour par strategie (S1, S2, S3, S4)
+Visualisation Solaire BE 2025 - 2 panneaux
+  Haut : revenus cumulatifs jour par jour par strategie (S1, S2, S3)
   Bas  : nuage de points des QH de production (ISP vs timestamp)
-Sortie : outputs/reports/solar_be_2026.png (300 DPI)
+Sortie : outputs/reports/solar_be_2025.png (300 DPI)
 """
 
+import glob
 from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -15,11 +16,11 @@ import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from matplotlib.lines import Line2D
 
-REPO    = Path(__file__).resolve().parent
-CSV     = REPO / "outputs" / "solar_be" / "simulation_be_2026.csv"
+REPO    = Path(__file__).resolve().parents[2]
+CSV_DIR = REPO / "outputs" / "solar_be" / "simulation_2025"
 OUT_DIR = REPO / "outputs" / "reports"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
-OUT_PNG = OUT_DIR / "solar_be_2026.png"
+OUT_PNG = OUT_DIR / "solar_be_2025.png"
 
 BG       = "#1a1a2e"
 GRID_COL = "#ffffff"
@@ -27,16 +28,19 @@ TEXT_COL = "#e0e0e0"
 
 STRAT_STYLES = {
     "S3": {"color": "#00d4ff", "lw": 2.5, "zorder": 5},
-    "S4": {"color": "#ff6b6b", "lw": 1.5, "zorder": 4},
     "S2": {"color": "#ffd700", "lw": 1.5, "zorder": 3},
     "S1": {"color": "#a8e6cf", "lw": 1.5, "zorder": 2},
 }
 
-df = pd.read_csv(CSV, parse_dates=["timestamp", "date"])
+files = sorted(glob.glob(str(CSV_DIR / "day_*.csv")))
+df = pd.concat(
+    [pd.read_csv(f, parse_dates=["timestamp", "date"]) for f in files],
+    ignore_index=True
+)
 
-strat_map = {"S1": "s1_total", "S2": "s2_total", "S3": "s3_total", "S4": "s4_total"}
+strat_cols = {"S1": "s1_total", "S2": "s2_total", "S3": "s3_total"}
 rows = []
-for s, col in strat_map.items():
+for s, col in strat_cols.items():
     if col not in df.columns:
         continue
     tmp = df.groupby("date")[col].sum().reset_index()
@@ -46,9 +50,8 @@ for s, col in strat_map.items():
 daily = pd.concat(rows).sort_values("date")
 daily["cumul"] = daily.groupby("strategy")["daily_rev"].cumsum()
 
-totals = daily.groupby("strategy")["daily_rev"].sum()
-best = totals.idxmax()
-best_total = totals[best]
+best = "S3"
+best_total = daily[daily["strategy"] == best]["daily_rev"].sum()
 date_min = df["date"].min()
 date_max = df["date"].max()
 
@@ -56,8 +59,6 @@ events = df[df["s1_production"] > 0].copy()
 events = events.dropna(subset=["isp"])
 events["size_pt"] = (events["s1_production"].clip(lower=0.1) * 6).clip(upper=80)
 events["color"]   = np.where(events["isp"] > 0, "#4ade80", "#f87171")
-
-strats_ordered = [s for s in ["S3", "S4", "S2", "S1"] if s in totals.index]
 
 fig, (ax1, ax2) = plt.subplots(
     2, 1, figsize=(14, 10), facecolor=BG,
@@ -70,7 +71,7 @@ for ax in (ax1, ax2):
     ax.xaxis.label.set_color(TEXT_COL)
     ax.yaxis.label.set_color(TEXT_COL)
 
-for strat in strats_ordered:
+for strat in ["S3", "S2", "S1"]:
     sub = daily[daily["strategy"] == strat]
     if sub.empty:
         continue
@@ -83,12 +84,12 @@ for strat in strats_ordered:
 ax1.axhline(0, color="#666688", lw=0.8, ls="--")
 ax1.set_ylabel("Revenu cumulatif (EUR)", color=TEXT_COL, fontsize=10)
 ax1.set_title(
-    f"Solaire BE 2026 - Strategies d'optimisation\n"
-    f"{best} (meilleure BE) total : {best_total:+.2f} EUR  "
+    f"Solaire BE 2025 - Strategies d'optimisation\n"
+    f"S3 (meilleure BE) total : {best_total:+.2f} EUR  "
     f"({date_min} -> {date_max})",
     color=TEXT_COL, fontsize=13, pad=12
 )
-ax1.xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
+ax1.xaxis.set_major_formatter(mdates.DateFormatter("%b"))
 ax1.xaxis.set_major_locator(mdates.MonthLocator())
 ax1.grid(True, color=GRID_COL, alpha=0.12, lw=0.6)
 ax1.legend(loc="upper left", fontsize=9,
@@ -102,7 +103,7 @@ ax2.axhline(0, color="#aaaacc", lw=1.0, ls="--", alpha=0.7)
 ax2.set_ylabel("ISP (EUR/MWh)", color=TEXT_COL, fontsize=10)
 ax2.set_title("QH de production S1 - ISP au moment de la production",
               color=TEXT_COL, fontsize=11, pad=8)
-ax2.xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
+ax2.xaxis.set_major_formatter(mdates.DateFormatter("%b"))
 ax2.xaxis.set_major_locator(mdates.MonthLocator())
 ax2.grid(True, color=GRID_COL, alpha=0.12, lw=0.6)
 

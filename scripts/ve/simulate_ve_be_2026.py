@@ -23,7 +23,7 @@ import requests
 # =============================================================================
 # PATHS & CONFIG
 # =============================================================================
-REPO              = Path(__file__).resolve().parent
+REPO              = Path(__file__).resolve().parents[2]
 DATA_2026         = REPO / "data_ve_2026"
 MERIT_CACHE       = DATA_2026 / "merit_cache"
 FORECAST_LOG_FULL = REPO / "forecasters" / "elia_forecaster" / "forecast_log_full.csv"

@@ -19,7 +19,7 @@ import matplotlib.dates as mdates
 from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
 
-REPO     = Path(__file__).resolve().parent
+REPO     = Path(__file__).resolve().parents[2]
 CSV_BE   = REPO / "outputs" / "ve_be" / "simulation_ve_be_2026.csv"
 CSV_FR   = REPO / "outputs" / "ve_fr" / "simulation_ve_fr_2026.csv"
 OUT_DIR  = REPO / "outputs" / "reports"

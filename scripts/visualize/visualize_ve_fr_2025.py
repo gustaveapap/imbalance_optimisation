@@ -15,7 +15,7 @@ import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from matplotlib.lines import Line2D
 
-REPO    = Path(__file__).resolve().parent
+REPO    = Path(__file__).resolve().parents[2]
 CSV     = REPO / "simulation_ve_2025_fr" / "simulation_complete.csv"
 OUT_DIR = REPO / "outputs" / "reports"
 OUT_DIR.mkdir(parents=True, exist_ok=True)

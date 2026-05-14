@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Visualisation Solaire FR 2025 - 2 panneaux
+Visualisation Solaire FR 2026 - 2 panneaux
   Haut : revenus cumulatifs jour par jour par strategie (S1, S2, S3)
   Bas  : nuage de points des QH de production (price_eur_mwh vs timestamp)
-Sortie : outputs/reports/solar_fr_2025.png (300 DPI)
+Sortie : outputs/reports/solar_fr_2026.png (300 DPI)
 """
 
 import glob
@@ -16,11 +16,11 @@ import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from matplotlib.lines import Line2D
 
-REPO    = Path(__file__).resolve().parent
-CSV_DIR = REPO / "outputs" / "solar_fr" / "simulation_2025"
+REPO    = Path(__file__).resolve().parents[2]
+CSV_DIR = REPO / "outputs" / "solar_fr" / "simulation_2026"
 OUT_DIR = REPO / "outputs" / "reports"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
-OUT_PNG = OUT_DIR / "solar_fr_2025.png"
+OUT_PNG = OUT_DIR / "solar_fr_2026.png"
 
 BG       = "#1a1a2e"
 GRID_COL = "#ffffff"
@@ -85,12 +85,12 @@ for strat in ["S3", "S2", "S1"]:
 ax1.axhline(0, color="#666688", lw=0.8, ls="--")
 ax1.set_ylabel("Revenu cumulatif (EUR)", color=TEXT_COL, fontsize=10)
 ax1.set_title(
-    f"Solaire FR 2025 - Strategies d'optimisation\n"
+    f"Solaire FR 2026 - Strategies d'optimisation\n"
     f"{best} (meilleure FR) total : {best_total:+.2f} EUR  "
     f"({date_min} -> {date_max})",
     color=TEXT_COL, fontsize=13, pad=12
 )
-ax1.xaxis.set_major_formatter(mdates.DateFormatter("%b"))
+ax1.xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
 ax1.xaxis.set_major_locator(mdates.MonthLocator())
 ax1.grid(True, color=GRID_COL, alpha=0.12, lw=0.6)
 ax1.legend(loc="upper left", fontsize=9,
@@ -104,7 +104,7 @@ ax2.axhline(0, color="#aaaacc", lw=1.0, ls="--", alpha=0.7)
 ax2.set_ylabel("Prix ISP (EUR/MWh)", color=TEXT_COL, fontsize=10)
 ax2.set_title("QH de production S1 - Prix ISP au moment de la production",
               color=TEXT_COL, fontsize=11, pad=8)
-ax2.xaxis.set_major_formatter(mdates.DateFormatter("%b"))
+ax2.xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
 ax2.xaxis.set_major_locator(mdates.MonthLocator())
 ax2.grid(True, color=GRID_COL, alpha=0.12, lw=0.6)
 
