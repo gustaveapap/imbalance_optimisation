@@ -23,12 +23,13 @@ import requests
 # =============================================================================
 # PATHS & CONFIG
 # =============================================================================
-REPO        = Path(__file__).resolve().parent
-DATA_2026   = REPO / "data_ve_2026"
-MERIT_CACHE = DATA_2026 / "merit_cache"
-FORECAST_V3 = REPO / "forecasters" / "elia_forecaster" / "forecastV3.csv"
-OUT_QH      = REPO / "outputs" / "ve_be" / "simulation_ve_be_2026.csv"
-OUT_DAILY   = REPO / "outputs" / "ve_be" / "summary_daily_ve_be_2026.csv"
+REPO              = Path(__file__).resolve().parent
+DATA_2026         = REPO / "data_ve_2026"
+MERIT_CACHE       = DATA_2026 / "merit_cache"
+FORECAST_LOG_FULL = REPO / "forecasters" / "elia_forecaster" / "forecast_log_full.csv"
+FORECAST_V3       = REPO / "forecasters" / "elia_forecaster" / "forecastV3.csv"
+OUT_QH            = REPO / "outputs" / "ve_be" / "simulation_ve_be_2026.csv"
+OUT_DAILY         = REPO / "outputs" / "ve_be" / "summary_daily_ve_be_2026.csv"
 
 ELIA_API     = "https://external-elia.opendatasoft.com/api/records/1.0/search/"
 ENTSOE_API   = "https://web-api.tp.entsoe.eu/api"
@@ -244,22 +245,61 @@ def get_da_price_be(ts):
 
 
 # =============================================================================
-# FORECAST VOLUME (forecastV3.csv)
+# FORECAST VOLUME (forecast_log_full.csv principal + forecastV3.csv pour mai+)
+# Chargé une seule fois en mémoire. Signe préservé — pas de abs().
+# forecast_value > 0 = surplus réseau → ISP tend négatif → bon moment pour charger.
 # =============================================================================
+_forecast_be_cache = None
+
+def _load_forecast_be():
+    global _forecast_be_cache
+    if _forecast_be_cache is not None:
+        return _forecast_be_cache
+    frames = []
+    # Source principale : forecast_log_full.csv (jan 2025 → avr 2026)
+    if FORECAST_LOG_FULL.exists():
+        try:
+            df = pd.read_csv(FORECAST_LOG_FULL,
+                             usecols=["forecast_time", "forecast_value"],
+                             parse_dates=["forecast_time"])
+            df = df.rename(columns={"forecast_time": "timestamp"})
+            frames.append(df)
+        except Exception as e:
+            print(f"  [VOL-BE] WARN forecast_log_full: {e}", flush=True)
+    # Complément : forecastV3.csv (couvre mai 2026 et données live récentes)
+    if FORECAST_V3.exists():
+        try:
+            df = pd.read_csv(FORECAST_V3,
+                             usecols=["forecast_time", "forecast_value"],
+                             parse_dates=["forecast_time"])
+            df = df.rename(columns={"forecast_time": "timestamp"})
+            frames.append(df)
+        except Exception as e:
+            print(f"  [VOL-BE] WARN forecastV3: {e}", flush=True)
+    if not frames:
+        _forecast_be_cache = pd.DataFrame(columns=["timestamp", "forecast_value"])
+        return _forecast_be_cache
+    combined = (pd.concat(frames, ignore_index=True)
+                .sort_values("timestamp")
+                .drop_duplicates("timestamp", keep="first")
+                .reset_index(drop=True))
+    _forecast_be_cache = combined
+    print(f"  [VOL-BE] {len(combined)} QH de forecast charges "
+          f"({combined['timestamp'].min().date()} -> {combined['timestamp'].max().date()})", flush=True)
+    return _forecast_be_cache
+
+
 def get_forecast_vol_be(ts):
-    """Retourne |forecast| pour le QH ts depuis forecastV3.csv. 0 si absent."""
-    try:
-        df = pd.read_csv(FORECAST_V3, header=None, usecols=[0, 1],
-                         names=["timestamp", "forecast"])
-        # errors='coerce' absorbe la ligne d'en-tête textuelle (→ NaT, ignorée)
-        df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
-        row = df[df["timestamp"] == pd.Timestamp(ts)]
-        if not row.empty:
-            v = row.iloc[0]["forecast"]
-            if pd.notna(v):
-                return abs(float(v))
-    except Exception:
-        pass
+    """Retourne forecast_volume pour le QH ts. 0 si absent. Signe préservé (pas de abs()).
+    Positif = surplus réseau = ISP tend négatif = intérêt de charger."""
+    df = _load_forecast_be()
+    if df.empty:
+        return 0.0
+    row = df[df["timestamp"] == pd.Timestamp(ts)]
+    if not row.empty:
+        v = row.iloc[0]["forecast_value"]
+        if pd.notna(v):
+            return float(v)
     return 0.0
 
 # =============================================================================

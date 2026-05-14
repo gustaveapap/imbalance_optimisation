@@ -24,10 +24,11 @@ import requests
 # =============================================================================
 # PATHS & CONFIG
 # =============================================================================
-REPO        = Path(__file__).resolve().parent
-DATA_2026   = REPO / "data_ve_2026"
-MERIT_CACHE = DATA_2026 / "merit_cache"
-FORECAST_LOG = REPO / "forecasters" / "rte_forecaster" / "forecast_log.csv"
+REPO                  = Path(__file__).resolve().parent
+DATA_2026             = REPO / "data_ve_2026"
+MERIT_CACHE           = DATA_2026 / "merit_cache"
+FORECAST_LOG_FULL_FR  = REPO / "forecasters" / "rte_forecaster" / "forecast_log_full.csv"
+FORECAST_LOG          = REPO / "forecasters" / "rte_forecaster" / "forecast_log.csv"
 OUT_QH      = REPO / "outputs" / "ve_fr" / "simulation_ve_fr_2026.csv"
 OUT_DAILY   = REPO / "outputs" / "ve_fr" / "summary_daily_ve_fr_2026.csv"
 
@@ -264,19 +265,61 @@ def get_da_price_fr(ts):
 
 
 # =============================================================================
-# FORECAST VOLUME (forecast_log.csv)
+# FORECAST VOLUME (forecast_log_full.csv principal + forecast_log.csv pour mai+)
+# Chargé une seule fois en mémoire. Signe préservé — pas de abs().
+# forecast_mwh > 0 = surplus réseau → ISP tend négatif → bon moment pour charger.
 # =============================================================================
+_forecast_fr_cache = None
+
+def _load_forecast_fr():
+    global _forecast_fr_cache
+    if _forecast_fr_cache is not None:
+        return _forecast_fr_cache
+    frames = []
+    # Source principale : forecast_log_full.csv (jan 2025 → avr 2026)
+    if FORECAST_LOG_FULL_FR.exists():
+        try:
+            df = pd.read_csv(FORECAST_LOG_FULL_FR,
+                             usecols=["timestamp", "forecast_mwh"],
+                             parse_dates=["timestamp"])
+            df = df.rename(columns={"forecast_mwh": "forecast_value"})
+            frames.append(df)
+        except Exception as e:
+            print(f"  [VOL-FR] WARN forecast_log_full: {e}", flush=True)
+    # Complément : forecast_log.csv (live, couvre mai 2026+)
+    if FORECAST_LOG.exists():
+        try:
+            df = pd.read_csv(FORECAST_LOG,
+                             usecols=["timestamp", "forecast_mwh"],
+                             parse_dates=["timestamp"])
+            df = df.rename(columns={"forecast_mwh": "forecast_value"})
+            frames.append(df)
+        except Exception as e:
+            print(f"  [VOL-FR] WARN forecast_log: {e}", flush=True)
+    if not frames:
+        _forecast_fr_cache = pd.DataFrame(columns=["timestamp", "forecast_value"])
+        return _forecast_fr_cache
+    combined = (pd.concat(frames, ignore_index=True)
+                .sort_values("timestamp")
+                .drop_duplicates("timestamp", keep="first")
+                .reset_index(drop=True))
+    _forecast_fr_cache = combined
+    print(f"  [VOL-FR] {len(combined)} QH de forecast charges "
+          f"({combined['timestamp'].min().date()} -> {combined['timestamp'].max().date()})", flush=True)
+    return _forecast_fr_cache
+
+
 def get_forecast_vol_fr(ts):
-    """Retourne |forecast| pour le QH ts depuis forecast_log.csv. 0 si absent."""
-    try:
-        df = pd.read_csv(FORECAST_LOG, header=None, usecols=[0, 1],
-                         names=["timestamp", "forecast"])
-        df["timestamp"] = pd.to_datetime(df["timestamp"])
-        row = df[df["timestamp"] == pd.Timestamp(ts)]
-        if not row.empty:
-            return abs(float(row.iloc[0]["forecast"]))
-    except Exception:
-        pass
+    """Retourne forecast_volume pour le QH ts. 0 si absent. Signe préservé (pas de abs()).
+    Positif = surplus réseau = ISP tend négatif = intérêt de charger."""
+    df = _load_forecast_fr()
+    if df.empty:
+        return 0.0
+    row = df[df["timestamp"] == pd.Timestamp(ts)]
+    if not row.empty:
+        v = row.iloc[0]["forecast_value"]
+        if pd.notna(v):
+            return float(v)
     return 0.0
 
 # =============================================================================
