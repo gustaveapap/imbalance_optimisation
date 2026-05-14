@@ -6,10 +6,12 @@ VE FR -- simulation en continu, un QH a la fois.
   Merit ratios : fetch live BE+DE+NL via solar_be_scheduler.compute_day_eu_metrics
                  (cache local merit_cache/merit_{date}.csv en fallback)
   Forecast vol : forecasters/rte_forecaster/forecast_log.csv
+  Prix DA      : ENTSO-E A44 (domaine FR)
 Au demarrage reprend depuis le dernier QH dans outputs/ve_fr/simulation_ve_fr_2026.csv.
 """
 
 import sys, io, time, base64
+import xml.etree.ElementTree as ET
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 
 from datetime import datetime, timedelta
@@ -34,6 +36,9 @@ CLIENT_SECRET = "da352352-63f8-42ce-9a34-0624f7560a72"
 RTE_TOKEN_URL = "https://digital.iservices.rte-france.com/token/oauth/"
 RTE_IMB_URL   = "https://digital.iservices.rte-france.com/open_api/balancing_energy/v5/imbalance_data"
 PARIS         = "Europe/Paris"
+ENTSOE_API    = "https://web-api.tp.entsoe.eu/api"
+ENTSOE_TOKEN  = "dcc0c513-dab6-4add-82be-7b693f2b7fab"
+FR_DOMAIN     = "10YFR-RTE------C"
 
 BAT_MAX    = 66.0
 CHARGER_QH = 2.75
@@ -49,17 +54,18 @@ STRATEGIES = ["S1", "S2", "S_BE_OPT"]
 START_DATE  = pd.Timestamp("2026-01-01")
 
 # =============================================================================
-# TRIGGERS (identiques VE BE)
+# TRIGGERS (alignes sur metriques 2025, identiques VE BE)
 # =============================================================================
-def s1_trigger(vol, mfrr, afrr):
-    return ((vol > 300 and mfrr > 75 and afrr > 65) or
-            ((mfrr > 95 or afrr > 95) and vol > 50) or
+def s1_trigger(vol, mfrr, afrr, da=np.nan):
+    return ((vol > 300 and mfrr > 75 and afrr > 75) or
+            (not pd.isna(da) and da < 0 and vol > 200 and afrr > 75) or
             (mfrr > 75 and afrr > 75 and vol > 100))
 
-def s2_trigger(vol, mfrr, afrr):
-    return mfrr > 80 or (mfrr > 60 and vol > 250)
+def s2_trigger(vol, mfrr, afrr, da=np.nan):
+    return ((not pd.isna(da) and da < 0 and vol > 150) or
+            (vol > 450 and afrr > 75))
 
-def s_be_opt(vol, mfrr, afrr):
+def s_be_opt(vol, mfrr, afrr, da=np.nan):
     return afrr > 50 and mfrr > 50 and vol > 200
 
 TRIGGER_FN = {"S1": s1_trigger, "S2": s2_trigger, "S_BE_OPT": s_be_opt}
@@ -167,7 +173,8 @@ def _fetch_merit_day(date_str):
 
 
 def get_merit_for_qh_fr(ts):
-    """Retourne (mfrr_ratio_neg, afrr_ratio_neg) — fetch live si cache absent."""
+    """Retourne (mfrr_ratio_neg, afrr_ratio_neg) — fetch live si cache absent.
+    Pour les QH live (jour en cours incomplet), utilise le meme creneau de J-1."""
     ts = pd.Timestamp(ts)
     for ds in [ts.strftime("%Y-%m-%d"),
                (ts - pd.Timedelta(days=1)).strftime("%Y-%m-%d")]:
@@ -175,11 +182,86 @@ def get_merit_for_qh_fr(ts):
         if df.empty:
             continue
         row = df[df["timestamp"] == ts]
+        if row.empty:
+            row = df[df["timestamp"].dt.time == ts.time()]
         if not row.empty:
             r = row.iloc[0]
             return (float(r.get("mfrr_ratio_negative", 0) or 0),
                     float(r.get("afrr_ratio_negative",  0) or 0))
     return 0.0, 0.0
+
+# =============================================================================
+# PRIX DA (ENTSO-E A44, domaine FR, cache local)
+# =============================================================================
+_da_day_cache_fr = {}
+
+def _fetch_da_day_fr(date_str):
+    if date_str in _da_day_cache_fr:
+        return _da_day_cache_fr[date_str]
+    cache_file = DATA_2026 / f"da_fr_{date_str}.csv"
+    DATA_2026.mkdir(exist_ok=True)
+    if cache_file.exists():
+        try:
+            df = pd.read_csv(cache_file, parse_dates=["timestamp"])
+            _da_day_cache_fr[date_str] = df
+            return df
+        except Exception:
+            pass
+    start = datetime.strptime(date_str, "%Y-%m-%d").strftime("%Y%m%d%H%M")
+    end   = (datetime.strptime(date_str, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y%m%d%H%M")
+    try:
+        r = requests.get(ENTSOE_API, params={
+            "securityToken": ENTSOE_TOKEN, "documentType": "A44",
+            "in_Domain": FR_DOMAIN, "out_Domain": FR_DOMAIN,
+            "periodStart": start, "periodEnd": end,
+        }, timeout=60)
+        if r.status_code != 200:
+            _da_day_cache_fr[date_str] = pd.DataFrame()
+            return pd.DataFrame()
+        rows = []
+        for period in ET.fromstring(r.content).findall(".//{*}Period"):
+            s_el = period.find(".//{*}start")
+            r_el = period.find(".//{*}resolution")
+            if s_el is None:
+                continue
+            s_dt = pd.to_datetime(s_el.text, utc=True)
+            res  = r_el.text if r_el is not None else "PT60M"
+            for pt in period.findall(".//{*}Point"):
+                pos = int(pt.find(".//{*}position").text)
+                px  = float(pt.find(".//{*}price.amount").text)
+                off = (timedelta(minutes=(pos - 1) * 15) if res == "PT15M"
+                       else timedelta(hours=(pos - 1)))
+                ts_paris = (s_dt + off).tz_convert(PARIS).tz_localize(None)
+                rows.append({"timestamp": ts_paris, "price_eur_mwh": px})
+        if not rows:
+            _da_day_cache_fr[date_str] = pd.DataFrame()
+            return pd.DataFrame()
+        base = pd.DataFrame({"timestamp": pd.date_range(
+            f"{date_str} 00:00", periods=96, freq="15min")})
+        df = (base.merge(
+                pd.DataFrame(rows).drop_duplicates("timestamp"),
+                on="timestamp", how="left")
+              .ffill().bfill())
+        df.to_csv(cache_file, index=False)
+        _da_day_cache_fr[date_str] = df
+        return df
+    except Exception as e:
+        print(f"  WARNING DA-FR {date_str}: {e}", flush=True)
+        _da_day_cache_fr[date_str] = pd.DataFrame()
+        return pd.DataFrame()
+
+
+def get_da_price_fr(ts):
+    """Retourne prix DA (EUR/MWh) pour le QH ts. np.nan si indisponible."""
+    ts = pd.Timestamp(ts)
+    df = _fetch_da_day_fr(ts.strftime("%Y-%m-%d"))
+    if df.empty:
+        return np.nan
+    row = df[df["timestamp"] == ts]
+    if not row.empty:
+        return float(row.iloc[0]["price_eur_mwh"])
+    return np.nan
+
 
 # =============================================================================
 # FORECAST VOLUME (forecast_log.csv)
@@ -200,7 +282,7 @@ def get_forecast_vol_fr(ts):
 # =============================================================================
 # UN PAS DE QH
 # =============================================================================
-def step_qh(ts, volume, prix_pos, prix_neg, mfrr, afrr, vol, soc):
+def step_qh(ts, volume, prix_pos, prix_neg, mfrr, afrr, vol, da, soc):
     """ISP FR = prix_positif si volume>0 sinon prix_negatif."""
     ts  = pd.Timestamp(ts)
     h   = ts.hour
@@ -230,8 +312,8 @@ def step_qh(ts, volume, prix_pos, prix_neg, mfrr, afrr, vol, soc):
 
         smart_kwh = 0.0
         remaining = CHARGER_QH - forced_kwh
-        if remaining > 0 and smart_window(h, is_weekend) and s < BAT_MAX and vol > 150:
-            if TRIGGER_FN[strat](vol, mfrr, afrr):
+        if remaining > 0 and smart_window(h, is_weekend) and s < BAT_MAX and vol > 50:
+            if TRIGGER_FN[strat](vol, mfrr, afrr, da):
                 smart_kwh = min(remaining, BAT_MAX - s)
         s += smart_kwh
         soc[strat] = s
@@ -394,15 +476,17 @@ def main():
             volume, prix_pos, prix_neg = result
             mfrr, afrr = get_merit_for_qh_fr(qh)
             vol         = get_forecast_vol_fr(qh)
+            da          = get_da_price_fr(qh)
 
-            rows = step_qh(qh, volume, prix_pos, prix_neg, mfrr, afrr, vol, soc)
+            rows = step_qh(qh, volume, prix_pos, prix_neg, mfrr, afrr, vol, da, soc)
             append_rows(rows)
             last_ts = qh
 
-            isp = prix_pos if volume > 0 else prix_neg
+            isp      = prix_pos if volume > 0 else prix_neg
             opt_cost = rows[STRATEGIES.index("S_BE_OPT")]["cost_eur"]
+            da_str   = f"{da:+6.1f}" if not pd.isna(da) else "   N/A"
             print(f"  {qh.strftime('%Y-%m-%d %H:%M')}  ISP={isp:+7.1f}  vol={vol:5.0f}  "
-                  f"mfrr={mfrr:4.0f}%  afrr={afrr:4.0f}%  "
+                  f"mfrr={mfrr:4.0f}%  afrr={afrr:4.0f}%  DA={da_str}  "
                   f"cout OPT={opt_cost:+.4f} EUR", flush=True)
 
             if last_summary_date != qh.date() and qh.hour == 23 and qh.minute == 45:
