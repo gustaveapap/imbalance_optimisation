@@ -349,7 +349,7 @@ def forecast_be(date_str, df_hist):
         if not X: return None
         preds = model.predict(np.array(X, dtype=np.float32))
         return pd.DataFrame([{
-            "timestamp": ts, "forecast_volume": abs(float(p)),
+            "timestamp": ts, "forecast_volume": float(p),
             "forecast_direction": "DOWN" if p > 0 else "UP",
         } for ts, p in zip(valid_ts, preds)])
     except Exception as e:

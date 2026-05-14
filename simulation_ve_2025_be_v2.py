@@ -15,10 +15,11 @@ NOUVELLE STRATEGIE : S_BE_opt
 =============================================================================
 """
 
-import time, warnings
+import re, time, warnings
 from datetime import datetime, timedelta
-from io import StringIO
+from io import StringIO, BytesIO
 from pathlib import Path
+from zipfile import ZipFile
 
 import numpy as np
 import pandas as pd
@@ -213,6 +214,233 @@ def _fetch_ods134_day(date_str):
     return df.drop_duplicates("timestamp")
 
 # =============================================================================
+# DOWNLOAD MERIT ORDER DE (Regelleistung)
+# =============================================================================
+
+def download_regelleistung(date_str, product_type="aFRR"):
+    try:
+        r = retry(lambda: requests.get(
+            "https://www.regelleistung.net/apps/crds/api/v2/tenders/results/anonymous",
+            params={"productType": product_type, "market": "ENERGY",
+                    "exportFormat": "xlsx", "deliveryDate": date_str},
+            timeout=60))
+        if r.status_code != 200 or r.content[:2] != b"PK":
+            return pd.DataFrame()
+        with ZipFile(BytesIO(r.content)) as z:
+            xml = z.read("xl/worksheets/sheet1.xml").decode("utf-8", errors="ignore")
+        rows = []
+        for row_match in re.finditer(r"<row r=\"\d+\">(.*?)</row>", xml, re.DOTALL):
+            cells = []
+            for cell in re.finditer(r"<c r=\"[A-Z]+\d+\"[^>]*>(.*?)</c>",
+                                    row_match.group(1), re.DOTALL):
+                t = re.search(r"<t>(.*?)</t>", cell.group(1))
+                v = re.search(r"<v>(.*?)</v>", cell.group(1))
+                cells.append(t.group(1) if t else (v.group(1) if v else ""))
+            rows.append(cells)
+        if len(rows) < 2: return pd.DataFrame()
+        headers = rows[0]
+        max_len = max(len(r) for r in rows)
+        data    = [r + [""] * (max_len - len(r)) for r in rows[1:]]
+        if max_len > len(headers):
+            headers = headers + [f"col_{i}" for i in range(max_len - len(headers))]
+        xde = pd.DataFrame(data, columns=headers)
+        if "PRODUCT" not in xde.columns: return pd.DataFrame()
+        xde["QH_IDX"] = xde["PRODUCT"].astype(str)\
+                          .str.extract(r"(\d{3})").astype(float).astype("Int64")
+        xde = xde.dropna(subset=["QH_IDX"])
+        xde["DeliveryDate"] = pd.to_datetime(
+            pd.to_numeric(xde["DELIVERY_DATE"], errors="coerce"),
+            unit="D", origin="1899-12-30").dt.normalize()
+        xde["timestamp"] = xde["DeliveryDate"] + \
+                           pd.to_timedelta((xde["QH_IDX"] - 1) * 15, unit="m")
+        qty_col = next((c for c in xde.columns if "CAPACITY" in c.upper()), None)
+        if qty_col is None: return pd.DataFrame()
+        offers = []
+        for pfx, direction in [("POS", "UP"), ("NEG", "DOWN")]:
+            sub = xde[xde["PRODUCT"].astype(str).str.startswith(pfx)].copy()
+            if sub.empty or "ENERGY_PRICE_[EUR/MWh]" not in sub.columns: continue
+            if "ENERGY_PRICE_PAYMENT_DIRECTION" in sub.columns:
+                mask = sub["ENERGY_PRICE_PAYMENT_DIRECTION"] == "GRID_TO_PROVIDER"
+                sub.loc[mask, "ENERGY_PRICE_[EUR/MWh]"] = \
+                    pd.to_numeric(sub.loc[mask, "ENERGY_PRICE_[EUR/MWh]"], errors="coerce") * -1
+            of = pd.DataFrame({
+                "timestamp": pd.to_datetime(sub["timestamp"]).dt.floor("15min"),
+                "direction": direction,
+                "price":     pd.to_numeric(sub["ENERGY_PRICE_[EUR/MWh]"], errors="coerce"),
+                "quantity":  pd.to_numeric(sub[qty_col], errors="coerce"),
+                "country": "DE", "reserve": product_type,
+            }).dropna()
+            of = of[of["quantity"] > 0]
+            if not of.empty: offers.append(of)
+        if not offers: return pd.DataFrame()
+        return pd.concat(offers, ignore_index=True).drop_duplicates(
+            subset=["timestamp", "direction", "price", "quantity", "reserve"])
+    except: return pd.DataFrame()
+
+# =============================================================================
+# DOWNLOAD MERIT ORDER BE (Elia ODS156/157)
+# =============================================================================
+
+def download_elia_dir(date_str, product, direction_name):
+    date_obj        = datetime.strptime(date_str, "%Y-%m-%d")
+    direction_label = "UP" if direction_name == "incremental" else "DOWN"
+    dataset_id      = "ods156" if direction_name == "incremental" else "ods157"
+    try:
+        date_end = date_obj + timedelta(days=1)
+        params   = {"dataset": dataset_id, "rows": 1000, "start": 0,
+                    "refine.balancingproduct": product, "sort": "datetime",
+                    "q": f"datetime:[{date_str}T00:00:00 TO {date_end.strftime('%Y-%m-%d')}T00:00:00]"}
+        r = requests.get("https://opendata.elia.be/api/records/1.0/search/",
+                         params=params, timeout=45)
+        if r.status_code != 200: return pd.DataFrame()
+        data  = r.json(); nhits = data.get("nhits", 0)
+        if nhits == 0: return pd.DataFrame()
+        recs = []; start = 0
+        while start < nhits and start < 10000:
+            params["start"] = start
+            rp = requests.get("https://opendata.elia.be/api/records/1.0/search/",
+                              params=params, timeout=45)
+            if rp.status_code == 200:
+                recs.extend(rp.json().get("records", [])); start += 1000
+            else: break
+            time.sleep(0.3)
+        offers = []
+        for rec in recs:
+            f  = rec.get("fields", {})
+            dt = pd.to_datetime(f.get("datetime", ""), errors="coerce", utc=True)
+            if pd.isna(dt): continue
+            ts = dt.tz_convert("Europe/Brussels").tz_localize(None).floor("15min")
+            if ts.date() != date_obj.date(): continue
+            try:
+                price    = float(f.get("energybidmarginalprice"))
+                quantity = float(f.get("energybidvolume"))
+            except: continue
+            if quantity <= 0: continue
+            offers.append({"timestamp": ts, "direction": direction_label,
+                           "price": price, "quantity": quantity,
+                           "country": "BE", "reserve": product})
+        df = pd.DataFrame(offers)
+        return df.drop_duplicates(
+            subset=["timestamp", "direction", "price", "quantity", "reserve"]
+        ) if not df.empty else pd.DataFrame()
+    except: return pd.DataFrame()
+
+def download_elia(date_str, product="aFRR"):
+    try:
+        up   = download_elia_dir(date_str, product, "incremental")
+        down = download_elia_dir(date_str, product, "decremental")
+        return pd.concat([up, down], ignore_index=True)
+    except: return pd.DataFrame()
+
+# =============================================================================
+# DOWNLOAD MERIT ORDER NL (TenneT)
+# =============================================================================
+
+def download_tennet(date_str):
+    try:
+        base = datetime.strptime(date_str + " 00:00:00", "%Y-%m-%d %H:%M:%S")
+        resp = requests.get(
+            "https://api.tennet.eu/publications/v1/merit-order-list",
+            headers={"apikey": API_KEY_TENNET, "Accept": "text/csv"},
+            params={"date_from": base.strftime("%d-%m-%Y %H:%M:%S"),
+                    "date_to":   (base + timedelta(days=1)).strftime("%d-%m-%Y %H:%M:%S")},
+            timeout=60)
+        if resp.status_code != 200 or not resp.content.strip():
+            return pd.DataFrame(), pd.DataFrame()
+        mo = pd.read_csv(StringIO(resp.content.decode("utf-8")))
+        tc = "Timeinterval Start Loc" if "Timeinterval Start Loc" in mo.columns \
+             else "Timeinterval Start (Local Time)"
+        if tc not in mo.columns: return pd.DataFrame(), pd.DataFrame()
+        mo["timestamp"] = pd.to_datetime(mo[tc], errors="coerce").dt.tz_localize(None)
+        mo = mo.dropna(subset=["timestamp", "Capacity Threshold"])
+        mo = mo[mo["timestamp"].dt.date == datetime.strptime(date_str, "%Y-%m-%d").date()]
+        mo = mo.sort_values(["timestamp", "Capacity Threshold"]).reset_index(drop=True)
+        mo["volume"] = mo.groupby("timestamp")["Capacity Threshold"]\
+                         .diff().fillna(mo["Capacity Threshold"])
+        mo = mo[mo["volume"] > 0]
+        all_a, all_m = [], []
+        for ts in mo["timestamp"].unique():
+            mt = mo[mo["timestamp"] == ts]
+            for pc, d in [("Price Up", "UP"), ("Price Down", "DOWN")]:
+                if pc not in mt.columns: continue
+                ots = mt[[pc, "volume"]].dropna().copy()
+                ots.columns = ["price", "quantity"]
+                ots["timestamp"] = ts
+                ots = ots.sort_values("price", ascending=(d == "UP"))
+                ots["cumul"] = ots["quantity"].cumsum()
+                af = ots[ots["cumul"] <= 110].copy()
+                mf = ots[ots["cumul"] > 110].copy()
+                cross = ots[(ots["cumul"] > 110) & ((ots["cumul"] - ots["quantity"]) < 110)]
+                if not cross.empty:
+                    rc = cross.iloc[0]
+                    qa = 110 - (rc["cumul"] - rc["quantity"]); qm = rc["quantity"] - qa
+                    if qa > 0:
+                        af = pd.concat([af, pd.DataFrame([{
+                            "timestamp": ts, "price": rc["price"], "quantity": qa}])],
+                            ignore_index=True)
+                    if qm > 0 and not mf.empty:
+                        mf.iloc[0, mf.columns.get_loc("quantity")] = qm
+                for dft, rt in [(af, "aFRR"), (mf, "mFRR")]:
+                    if dft.empty: continue
+                    dft = dft[["timestamp", "price", "quantity"]].copy()
+                    dft["direction"] = d; dft["country"] = "NL"; dft["reserve"] = rt
+                    (all_a if rt == "aFRR" else all_m).append(dft)
+        def cat(lst):
+            if not lst: return pd.DataFrame()
+            df = pd.concat(lst, ignore_index=True)
+            df.drop_duplicates(
+                subset=["timestamp", "direction", "price", "quantity", "reserve"],
+                inplace=True)
+            return df
+        return cat(all_a), cat(all_m)
+    except: return pd.DataFrame(), pd.DataFrame()
+
+# =============================================================================
+# DOWNLOAD PRIX DA BE (ENTSO-E A44)
+# =============================================================================
+
+def download_prix_da_be(date_str):
+    try:
+        def fetch():
+            start = datetime.strptime(date_str, "%Y-%m-%d").strftime("%Y%m%d%H%M")
+            end   = (datetime.strptime(date_str, "%Y-%m-%d") +
+                     timedelta(days=1)).strftime("%Y%m%d%H%M")
+            resp  = requests.get(BASE_URL_ENTSOE_API,
+                params={"securityToken": ENTSOE_TOKEN, "documentType": "A44",
+                        "in_Domain": "10YBE----------2",
+                        "out_Domain": "10YBE----------2",
+                        "periodStart": start, "periodEnd": end}, timeout=120)
+            return resp.content if resp.status_code == 200 else None
+        content = retry(fetch, n=3, delay=3)
+        if content is None: return pd.DataFrame()
+        root = ET.fromstring(content)
+        ns   = {"ns": "urn:iec62325.351:tc57wg16:451-3:publicationdocument:7:3"}
+        rows = []
+        for ts_el in root.findall(".//ns:TimeSeries", ns):
+            for period in ts_el.findall(".//ns:Period", ns):
+                start_el = period.find(".//ns:timeInterval/ns:start", ns)
+                if start_el is None: continue
+                start_dt   = pd.to_datetime(start_el.text, utc=True)
+                res_el     = period.find(".//ns:resolution", ns)
+                resolution = res_el.text if res_el is not None else None
+                points     = period.findall(".//ns:Point", ns)
+                for p in points:
+                    pos   = int(p.find(".//ns:position", ns).text)
+                    price = float(p.find(".//ns:price.amount", ns).text)
+                    offset = timedelta(minutes=(pos-1)*15) \
+                             if (resolution == "PT15M" or len(points) > 24) \
+                             else timedelta(hours=(pos-1))
+                    ts_loc = (start_dt + offset).tz_convert(BRUSSELS).tz_localize(None)
+                    rows.append({"timestamp": ts_loc, "price_eur_mwh": price})
+        df = pd.DataFrame(rows)
+        if df.empty: return pd.DataFrame()
+        df = df.drop_duplicates(subset=["timestamp"])\
+               .sort_values("timestamp").reset_index(drop=True)
+        df = ensure_qh(df, date_str, kind="da")
+        return df[["timestamp", "price_eur_mwh"]]
+    except: return pd.DataFrame()
+
+# =============================================================================
 # DOWNLOAD INTELLIGENT (ODS133 + ODS134)
 # =============================================================================
 
@@ -248,6 +476,25 @@ def intelligent_download():
                 df_qh["isp"] = np.nan
             df_qh.to_csv(DATA_DIR / f"imbalance_be_{ds}.csv", index=False)
             print(f"imb:{len(df_qh)}", end=" ")
+
+        for product, prefix in [("aFRR","afrr"), ("mFRR","mfrr")]:
+            out = DATA_DIR / f"{prefix}_de_{ds}.csv"
+            if not out.exists() or out.stat().st_size < 200:
+                df_m = download_regelleistung(ds, product)
+                if not df_m.empty: df_m.to_csv(out, index=False)
+        for product, prefix in [("aFRR","afrr"), ("mFRR","mfrr")]:
+            out = DATA_DIR / f"{prefix}_be_{ds}.csv"
+            if not out.exists():
+                df_m = download_elia(ds, product)
+                if not df_m.empty: df_m.to_csv(out, index=False)
+        af_nl, mf_nl = download_tennet(ds)
+        if not af_nl.empty: af_nl.to_csv(DATA_DIR / f"afrr_nl_{ds}.csv", index=False)
+        if not mf_nl.empty: mf_nl.to_csv(DATA_DIR / f"mfrr_nl_{ds}.csv", index=False)
+        out_da = DATA_DIR / f"prix_da_be_{ds}.csv"
+        if not out_da.exists():
+            df_da_be = download_prix_da_be(ds)
+            if not df_da_be.empty: df_da_be.to_csv(out_da, index=False)
+
         print("OK")
         time.sleep(1)
 
@@ -578,7 +825,7 @@ def main():
         rat_m = compute_ratio_negative(load_merit_day(ds, "mfrr"), ds, "mfrr")
 
         df_da = pd.DataFrame()
-        da_f  = DATA_DIR / f"prix_da_{ds}.csv"
+        da_f  = DATA_DIR / f"prix_da_be_{ds}.csv"
         if da_f.exists():
             try: df_da = ensure_qh(pd.read_csv(da_f, parse_dates=["timestamp"]), ds, kind="da")
             except: pass
