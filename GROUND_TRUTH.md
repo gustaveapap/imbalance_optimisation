@@ -14,14 +14,26 @@
 > ISP depuis cache local (BE : isp\_2026-\*.csv / FR : bulk-fetch RTE par jour),
 > fix DST 2026-03-29 02:00 (FR). Services VeBeSimulator2026 + VeFrSimulator2026 en prod.
 
+## Notes Solar
+
+> Solar FR 2025 : source autoritaire = `day_*.csv` (364 fichiers, somme = 63 545.19 €).
+> Le `summary_2025.csv` est inexact (55 jours divergent, écart −146 €) — ne pas utiliser.
+>
+> Solar BE 2026 : 26 391 € = simulation complète jan→mai 12 (132 j) avec métriques correctes.
+> Valeur précédente 19 399 € était un snapshot jan→avr (101 j) avant continuation du service.
+>
+> Solar FR 2026 : 22 531 € = S2 DA-adapt, jan→mai 13 (133 j), logique vérifiée (DOWN bids,
+> forecast\_volume sans abs() effectif, triggers VE-éprouvés).
+> Archive legacy S4 (14 919 €, 102 j jan→avr) : `outputs/solar_fr/simulation_2026/summary_2026_s4_legacy.csv`.
+
 ## Solaire (revenus)
 
 | Simulation | Résultat | Stratégie | Fichier source |
 |---|---|---|---|
 | Solar BE 2025 | **68 514€** | S3 | `outputs/solar_be/simulation_2025/` |
-| Solar FR 2025 | **63 545€** | S3 | `outputs/solar_fr/simulation_2025/` |
-| Solar BE 2026 | **19 399€** | S3 | `outputs/solar_be/simulation_be_2026.csv` |
-| Solar FR 2026 | **14 919€** | S4 | `simulation_solar_intelligent/summary_2026.csv` |
+| Solar FR 2025 | **63 545€** | S3 | `outputs/solar_fr/simulation_2025/day_*.csv` |
+| Solar BE 2026 | **26 391€** | S3 | `outputs/solar_be/simulation_be_2026.csv` |
+| Solar FR 2026 | **22 531€** | S2 | `outputs/solar_fr/simulation_2026/summary_2026.csv` |
 
 ## Trigger S_BE_opt
 
