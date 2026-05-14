@@ -134,6 +134,11 @@ def home():
                 <button type="button" style="background-color:#e8543a;">🇫🇷 RTE FR Dashboard</button>
             </a>
         </div>
+        <div style="margin-top: 16px;">
+            <a href="/reports" target="_blank" style="text-decoration: none;">
+                <button type="button" style="background-color:#7c3aed;">📊 Reports 2026</button>
+            </a>
+        </div>
     </body>
     </html>
     """
@@ -1100,6 +1105,327 @@ def dashboard_rte():
         fig.update_yaxes(showgrid=True, gridcolor=color_grid, title_text="MWh", row=1, col=1)
 
         return fig.to_html(full_html=True, include_plotlyjs="cdn")
+
+    except Exception as e:
+        import traceback
+        return (f"<pre style='color:red;background:#0b0e16;padding:20px'>"
+                f"{traceback.format_exc()}</pre>")
+
+
+# --------------------------------------------------------------------------------------
+# VE 2026 DASHBOARD (BE + FR)
+# --------------------------------------------------------------------------------------
+REPO_ROOT   = BASE_DIR.parent.parent
+REPORTS_DIR = REPO_ROOT / "outputs" / "reports"
+
+@app.route("/ve_2026")
+def ve_2026():
+    import base64
+
+    def _img_b64(filename):
+        p = REPORTS_DIR / filename
+        if not p.exists():
+            return None
+        return base64.b64encode(p.read_bytes()).decode()
+
+    be_b64 = _img_b64("ve_be_2026.png")
+    fr_b64 = _img_b64("ve_fr_2026.png")
+
+    cards = []
+    for title, cost, b64 in [
+        ("VE Belgique 2026", "+86.86 EUR", be_b64),
+        ("VE France 2026",  "-11.18 EUR", fr_b64),
+    ]:
+        color = "#f87171" if cost.startswith("+") else "#4ade80"
+        img_tag = (f'<img src="data:image/png;base64,{b64}" '
+                   f'style="width:100%;border-radius:8px">'
+                   if b64 else '<p style="color:#aaa">Image non trouvee</p>')
+        cards.append(f"""
+        <div style="background:#12122a;border:1px solid #2a2a4a;
+                    border-radius:12px;padding:20px;margin-bottom:32px">
+          <div style="display:flex;justify-content:space-between;
+                      align-items:center;margin-bottom:14px">
+            <h2 style="margin:0;color:#e0e0e0;font-size:1.2rem">{title}</h2>
+            <span style="color:{color};font-size:1.6rem;
+                         font-weight:700;letter-spacing:1px">{cost}</span>
+          </div>
+          {img_tag}
+        </div>""")
+
+    html = f"""<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>VE 2026 Dashboard</title>
+  <style>
+    body{{margin:0;padding:24px;background:#0b0e16;
+         font-family:'Segoe UI',sans-serif;color:#e0e0e0}}
+    h1{{text-align:center;color:#00d4ff;font-size:1.5rem;margin-bottom:8px}}
+    .sub{{text-align:center;color:#666;font-size:.85rem;margin-bottom:32px}}
+    .grid{{max-width:1400px;margin:0 auto}}
+    a{{color:#00d4ff;font-size:.85rem}}
+  </style>
+</head>
+<body>
+  <h1>VE 2026 — Dashboard Charge Intelligente</h1>
+  <p class="sub">
+    S_BE_opt &nbsp;|&nbsp; forecast_volume &gt; 200 AND afrr &gt; 50% AND mfrr &gt; 50%
+    &nbsp;&nbsp;|&nbsp;&nbsp;
+    <a href="/">Elia Dashboard</a> &nbsp;|&nbsp;
+    <a href="/dashboard_rte">RTE Dashboard</a>
+  </p>
+  <div class="grid">
+    {''.join(cards)}
+  </div>
+</body>
+</html>"""
+    return html
+
+
+# --------------------------------------------------------------------------------------
+# REPORTS DASHBOARD (VE + Solar 2026 — Plotly dark Bloomberg)
+# --------------------------------------------------------------------------------------
+@app.route("/reports")
+def reports_dashboard():
+    try:
+        BG   = "#0b0e16"
+        GRID = "rgba(255,255,255,0.08)"
+        _LAY = dict(
+            template="plotly_dark",
+            paper_bgcolor=BG, plot_bgcolor=BG,
+            font=dict(color="white", family="Segoe UI"),
+            hovermode="x unified",
+        )
+        C_VE  = {"S_BE_OPT": "#00e5ff", "S1": "#ff9800", "S2": "#ab47bc"}
+        L_VE  = {"S_BE_OPT": "S_BE_opt", "S1": "S1 Prudent", "S2": "S2 DA"}
+        C_SOL = {"s1": "#ff9800", "s2": "#ab47bc", "s3": "#00e5ff", "s4": "#4ade80"}
+
+        # ── VE ─────────────────────────────────────────────────────────────────
+        def _ve_fig(csv_path, label):
+            df = pd.read_csv(csv_path, parse_dates=["timestamp", "date"])
+            df["date"] = pd.to_datetime(df["date"])
+            strats = [s for s in ["S_BE_OPT", "S1", "S2"] if s in df["strategy"].unique()]
+            daily  = (df.groupby(["strategy", "date"])["cost_eur"]
+                        .sum().reset_index().sort_values("date"))
+            smart  = df[(df["smart_kwh"] > 0) & (df["strategy"] == "S_BE_OPT")].copy()
+            total  = df[df["strategy"] == "S_BE_OPT"]["cost_eur"].sum()
+            sign   = "+" if total >= 0 else ""
+            kpi    = f"{sign}{total:.2f} €"
+
+            fig = sp.make_subplots(
+                rows=2, cols=1,
+                subplot_titles=["Coûts cumulatifs par stratégie",
+                                "Charge smart S_BE_opt — ISP (€/MWh)"],
+                vertical_spacing=0.13, row_heights=[0.55, 0.45],
+            )
+            for s in strats:
+                sub = daily[daily["strategy"] == s].set_index("date")["cost_eur"]
+                cum = sub.cumsum().reset_index()
+                fig.add_trace(go.Scatter(
+                    x=cum["date"], y=cum["cost_eur"], mode="lines",
+                    line=dict(color=C_VE.get(s, "#fff"), width=2.2),
+                    name=L_VE.get(s, s),
+                ), row=1, col=1)
+
+            if not smart.empty:
+                kwh_rng = smart["smart_kwh"].max() - smart["smart_kwh"].min()
+                sizes   = (6 + 16 * (smart["smart_kwh"] - smart["smart_kwh"].min())
+                           / (kwh_rng + 1e-9))
+                neg_m = smart["isp"] < 0
+                for mask, color, sym, name in [
+                    (neg_m,  "#00c853", "circle",      "ISP < 0 (gain)"),
+                    (~neg_m, "#ff1744", "x-thin-open", "ISP ≥ 0 (coût)"),
+                ]:
+                    sub2 = smart[mask]
+                    if not sub2.empty:
+                        fig.add_trace(go.Scatter(
+                            x=sub2["date"], y=sub2["isp"], mode="markers",
+                            marker=dict(color=color, size=sizes[mask].values,
+                                        symbol=sym, opacity=0.8),
+                            name=name,
+                        ), row=2, col=1)
+
+            fig.update_layout(**_LAY, height=720, title=f"{label}  —  S_BE_opt : {kpi}")
+            fig.add_hline(y=0, line_color="#333", line_width=0.8, row=1, col=1)
+            fig.add_hline(y=0, line_color="#444", line_width=0.8, row=2, col=1)
+            fig.update_xaxes(showgrid=True, gridcolor=GRID, tickformat="%b")
+            fig.update_yaxes(showgrid=True, gridcolor=GRID)
+            fig.update_yaxes(title_text="Coût cumulatif (€)", row=1, col=1)
+            fig.update_yaxes(title_text="ISP (€/MWh)", row=2, col=1)
+            return fig, kpi, total >= 0
+
+        # ── Solar BE ───────────────────────────────────────────────────────────
+        def _solar_be_fig(csv_path, label):
+            df = pd.read_csv(csv_path, parse_dates=["timestamp"])
+            df["date"] = df["timestamp"].dt.floor("D")
+            daily = df.groupby("date")[
+                ["s1_total", "s2_total", "s3_total", "s4_total"]
+            ].sum().reset_index()
+            total = daily["s3_total"].sum()
+            sign  = "+" if total >= 0 else ""
+            kpi   = f"{sign}{total:,.0f} €"
+
+            fig = sp.make_subplots(
+                rows=2, cols=1,
+                subplot_titles=["Revenus cumulatifs par stratégie",
+                                "ISP (€/MWh) — QH avec production"],
+                vertical_spacing=0.13, row_heights=[0.55, 0.45],
+            )
+            for s, lbl in [("s1", "S1"), ("s2", "S2"), ("s3", "S3"), ("s4", "S4")]:
+                cum = daily[f"{s}_total"].cumsum()
+                fig.add_trace(go.Scatter(
+                    x=daily["date"], y=cum, mode="lines",
+                    line=dict(color=C_SOL[s], width=2.2), name=lbl,
+                ), row=1, col=1)
+
+            if "production_mw" in df.columns and "isp" in df.columns:
+                prod = df[(df["production_mw"] > 0) & df["isp"].notna()].copy()
+                if not prod.empty:
+                    p_rng = prod["production_mw"].max() - prod["production_mw"].min()
+                    sizes = (4 + 12 * (prod["production_mw"] - prod["production_mw"].min())
+                             / (p_rng + 1e-9))
+                    neg_m = prod["isp"] < 0
+                    for mask, color, name in [
+                        (neg_m,  "#00c853", "ISP < 0"),
+                        (~neg_m, "#ff9800", "ISP ≥ 0"),
+                    ]:
+                        sub = prod[mask]
+                        if not sub.empty:
+                            fig.add_trace(go.Scatter(
+                                x=sub["date"], y=sub["isp"], mode="markers",
+                                marker=dict(color=color, size=sizes[mask].values, opacity=0.5),
+                                name=name,
+                            ), row=2, col=1)
+
+            fig.update_layout(**_LAY, height=720, title=f"{label}  —  S3 : {kpi}")
+            fig.add_hline(y=0, line_color="#333", line_width=0.8, row=1, col=1)
+            fig.add_hline(y=0, line_color="#444", line_width=0.8, row=2, col=1)
+            fig.update_xaxes(showgrid=True, gridcolor=GRID, tickformat="%b")
+            fig.update_yaxes(showgrid=True, gridcolor=GRID)
+            fig.update_yaxes(title_text="Revenu cumulatif (€)", row=1, col=1)
+            fig.update_yaxes(title_text="ISP (€/MWh)", row=2, col=1)
+            return fig, kpi, total >= 0
+
+        # ── Solar FR ───────────────────────────────────────────────────────────
+        def _solar_fr_fig(csv_path, label):
+            df = pd.read_csv(csv_path, parse_dates=["date"])
+            df = df.sort_values("date")
+            total = df["s3_total"].sum()
+            sign  = "+" if total >= 0 else ""
+            kpi   = f"{sign}{total:,.0f} €"
+
+            fig = sp.make_subplots(
+                rows=2, cols=1,
+                subplot_titles=["Revenus cumulatifs par stratégie",
+                                "S3 — DA vs Déséquilibre (journalier)"],
+                vertical_spacing=0.13, row_heights=[0.55, 0.45],
+            )
+            for s, lbl in [("s1", "S1"), ("s2", "S2"), ("s3", "S3")]:
+                cum = df[f"{s}_total"].cumsum()
+                fig.add_trace(go.Scatter(
+                    x=df["date"], y=cum, mode="lines",
+                    line=dict(color=C_SOL[s], width=2.2), name=lbl,
+                ), row=1, col=1)
+
+            fig.add_trace(go.Bar(
+                x=df["date"], y=df["s3_da"],
+                name="S3 DA", marker_color="deepskyblue", opacity=0.7,
+            ), row=2, col=1)
+            fig.add_trace(go.Bar(
+                x=df["date"], y=df["s3_imb"],
+                name="S3 Imbalance", marker_color="#ff9800", opacity=0.7,
+            ), row=2, col=1)
+
+            fig.update_layout(**_LAY, height=720, barmode="relative",
+                              title=f"{label}  —  S3 : {kpi}")
+            fig.add_hline(y=0, line_color="#333", line_width=0.8, row=1, col=1)
+            fig.add_hline(y=0, line_color="#444", line_width=0.8, row=2, col=1)
+            fig.update_xaxes(showgrid=True, gridcolor=GRID, tickformat="%b")
+            fig.update_yaxes(showgrid=True, gridcolor=GRID)
+            fig.update_yaxes(title_text="Revenu cumulatif (€)", row=1, col=1)
+            fig.update_yaxes(title_text="Revenu journalier (€)", row=2, col=1)
+            return fig, kpi, total >= 0
+
+        # ── Assemble ───────────────────────────────────────────────────────────
+        sims = [
+            ("VE Belgique 2026",
+             REPO_ROOT / "outputs" / "ve_be" / "simulation_ve_be_2026.csv", "ve"),
+            ("VE France 2026",
+             REPO_ROOT / "outputs" / "ve_fr" / "simulation_ve_fr_2026.csv", "ve"),
+            ("Solaire Belgique 2026",
+             REPO_ROOT / "outputs" / "solar_be" / "simulation_be_2026.csv", "solar_be"),
+            ("Solaire France 2026",
+             REPO_ROOT / "outputs" / "solar_fr" / "simulation_2026" / "summary_2026.csv",
+             "solar_fr"),
+        ]
+
+        sections = []
+        for sim_label, csv_path, sim_type in sims:
+            try:
+                if sim_type == "ve":
+                    fig, kpi, is_cost = _ve_fig(csv_path, sim_label)
+                    kpi_color = "#f87171" if is_cost else "#4ade80"
+                elif sim_type == "solar_be":
+                    fig, kpi, is_pos = _solar_be_fig(csv_path, sim_label)
+                    kpi_color = "#4ade80" if is_pos else "#f87171"
+                else:
+                    fig, kpi, is_pos = _solar_fr_fig(csv_path, sim_label)
+                    kpi_color = "#4ade80" if is_pos else "#f87171"
+
+                sections.append(
+                    f'<div class="section">'
+                    f'<div class="sec-hdr">'
+                    f'<span class="sec-title">{sim_label}</span>'
+                    f'<span style="color:{kpi_color};font-size:1.4rem;font-weight:700">{kpi}</span>'
+                    f'</div>'
+                    f'{fig.to_html(full_html=False, include_plotlyjs=False)}'
+                    f'</div>'
+                )
+            except Exception as _e:
+                import traceback as _tb
+                sections.append(
+                    f'<div class="section">'
+                    f'<p style="color:#f87171">Erreur {sim_label} : {_e}</p>'
+                    f'<pre style="color:#aaa;font-size:11px">{_tb.format_exc()}</pre>'
+                    f'</div>'
+                )
+
+        return f"""<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Reports 2026</title>
+  <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+  <style>
+    *{{box-sizing:border-box}}
+    body{{margin:0;padding:0;background:{BG};color:#e0e0e0;font-family:'Segoe UI',Arial,sans-serif}}
+    .hdr{{background:#0d1120;border-bottom:1px solid #1e2a3a;padding:14px 28px;
+          display:flex;align-items:center;gap:20px;flex-wrap:wrap;
+          position:sticky;top:0;z-index:10}}
+    .hdr h1{{margin:0;font-size:18px;color:deepskyblue}}
+    .nav{{display:flex;gap:16px;margin-left:auto;flex-wrap:wrap}}
+    .nav a{{color:#aaa;text-decoration:none;font-size:13px}}
+    .nav a:hover{{color:white}}
+    .section{{max-width:1500px;margin:28px auto 48px auto;padding:0 24px}}
+    .sec-hdr{{display:flex;justify-content:space-between;align-items:center;
+              margin-bottom:10px;border-bottom:1px solid #1e2a3a;padding-bottom:8px}}
+    .sec-title{{font-size:1.05rem;font-weight:600;color:#e0e0e0}}
+  </style>
+</head>
+<body>
+  <div class="hdr">
+    <h1>📊 Reports 2026 — Simulations</h1>
+    <nav class="nav">
+      <a href="/">⚡ Elia BE</a>
+      <a href="/dashboard_rte">🇫🇷 RTE FR</a>
+      <a href="/evaluation">Évaluation</a>
+    </nav>
+  </div>
+  {''.join(sections)}
+</body>
+</html>"""
 
     except Exception as e:
         import traceback
