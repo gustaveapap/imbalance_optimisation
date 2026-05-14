@@ -81,8 +81,9 @@ def smart_window(h, is_weekend):
 # HELPER TIMEZONE PARIS
 # =============================================================================
 def _fmt_paris(t):
-    """Formate un Timestamp naive en ISO8601 avec offset Paris (DST-aware)."""
-    aw  = t.tz_localize(_TZ_PARIS)
+    """Formate un Timestamp naive en ISO8601 avec offset Paris (DST-aware).
+    nonexistent='shift_forward' : 02:00 DST printemps -> 03:00 sans erreur."""
+    aw  = t.tz_localize(_TZ_PARIS, nonexistent="shift_forward", ambiguous=False)
     off = aw.strftime("%z")        # +0200 ou +0100
     return t.strftime("%Y-%m-%dT%H:%M:%S") + off[:3] + ":" + off[3:]
 
@@ -187,6 +188,12 @@ def _fetch_isp_fr_day_bulk(date_str):
 def fetch_isp_fr(ts, retries=5, delay=30):
     """Retourne (volume, prix_positif, prix_negatif) pour le QH ts. None si indisponible."""
     ts = pd.Timestamp(ts)
+    # QH inexistant (transition DST printemps, ex. 2026-03-29 02:00-02:15) -> pas de charge
+    # Le venv ZoneInfo décale silencieusement 02:00->03:00 sans lever d'exception :
+    # on détecte le décalage en comparant l'heure locale avant/après localisation.
+    _loc = ts.tz_localize(_TZ_PARIS)
+    if _loc.replace(tzinfo=None) != ts:
+        return (0.0, 0.0, 0.0)
     # Cache local (ou bulk-fetch du jour si pas encore chargé)
     date_str = ts.strftime("%Y-%m-%d")
     _fetch_isp_fr_day_bulk(date_str)
